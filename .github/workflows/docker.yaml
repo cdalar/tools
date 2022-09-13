@@ -1,6 +1,9 @@
 name: ci
 
 on:
+  pull_request:
+    branches:    
+      - 'main'
   push:
     branches:
       - 'main'
@@ -26,5 +29,6 @@ jobs:
         uses: docker/build-push-action@v3
         with:
           push: true
-          file: Dockerfile.ubuntu
+          platforms: linux/amd64,linux/arm64
+          file: images/Dockerfile.ubuntu
           tags: cdalar/ubuntu:latest
