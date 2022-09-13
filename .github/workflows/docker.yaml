@@ -26,5 +26,5 @@ jobs:
         uses: docker/build-push-action@v3
         with:
           push: true
-          file: Dockerfile.ubuntu
+          file: images/Dockerfile.ubuntu
           tags: cdalar/ubuntu:latest
