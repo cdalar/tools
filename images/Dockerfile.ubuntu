@@ -1,0 +1,14 @@
+FROM ubuntu:20.04
+RUN apt-get update 
+RUN apt-get install -y vim wget curl jq unzip git bash-completion fzf 
+### kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+RUN install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+RUN echo 'alias k=kubectl' >> /root/.bashrc
+RUN echo 'source <(kubectl completion bash)' >>/root/.bashrc
+RUN echo 'complete -o default -F __start_kubectl k' >>/root/.bashrc
+### k9s
+RUN wget https://github.com/derailed/k9s/releases/download/v0.26.3/k9s_Linux_x86_64.tar.gz
+RUN tar zxf k9s_Linux_x86_64.tar.gz
+RUN mv k9s /usr/local/bin/
+CMD ["sleep","infinity"]
