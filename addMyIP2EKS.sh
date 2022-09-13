@@ -1,5 +1,5 @@
 #!/bin/bash
-EKS_CLUSTER_NAME=$(/usr/local/bin/aws eks list-clusters --region=eu-central-1 | jq -r .clusters[0])
+EKS_CLUSTER_NAME=$(kubectl config current-context | awk -F'/' '{print $NF}')
 echo $EKS_CLUSTER_NAME
 MYIP=$(curl -s 'https://api.ipify.org?format=json' | jq -r .ip | awk '{print $1 "/32"}')
 echo $MYIP
