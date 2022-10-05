@@ -1,6 +1,6 @@
 FROM ubuntu:20.04
 RUN apt-get update \
-    && apt-get install -y vim wget openssl curl jq unzip git bash-completion fzf 
+    && apt-get install -y vim wget openssl curl jq unzip git bash-completion fzf netcat
 
 ### install az cli
 RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
