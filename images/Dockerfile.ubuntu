@@ -5,6 +5,12 @@ RUN apt-get update \
 ### install az cli
 RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
 
+### websocat
+
+RUN https://github.com/vi/websocat/releases/download/v1.11.0/websocat.x86_64-unknown-linux-musl -O websocat
+RUN chmod +x websocat 
+RUN mv websocat /usr/local/bin/
+
 ### kubectl
 RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
 RUN install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
