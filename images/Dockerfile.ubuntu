@@ -7,7 +7,7 @@ RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
 
 ### websocat
 
-RUN https://github.com/vi/websocat/releases/download/v1.11.0/websocat.x86_64-unknown-linux-musl -O websocat
+RUN wget https://github.com/vi/websocat/releases/download/v1.11.0/websocat.x86_64-unknown-linux-musl -O websocat
 RUN chmod +x websocat 
 RUN mv websocat /usr/local/bin/
 
