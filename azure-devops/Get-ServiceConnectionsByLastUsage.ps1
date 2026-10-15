@@ -15,8 +15,10 @@
 
 .PARAMETER Pat
     Personal Access Token with the "Service Connections (Read)" scope.
-    Defaults to the AZDO_PAT environment variable. If neither is set, the
-    script falls back to the Azure CLI (az login) for a token.
+    Defaults to the AZDO_PAT environment variable, then AZURE_DEVOPS_EXT_PAT
+    (the one az devops reads). If none is set, the script falls back to the
+    Azure CLI (az login) for a token; organizations that reject that token
+    (e.g. ones backed by a personal Microsoft account) need a PAT.
 
 .PARAMETER Ascending
     Sort oldest first, which is handy for finding stale connections.
@@ -36,7 +38,7 @@
 param(
     [Parameter(Mandatory)] [string] $Organization,
     [string] $Project,
-    [string] $Pat = $env:AZDO_PAT,
+    [string] $Pat = $(if ($env:AZDO_PAT) { $env:AZDO_PAT } else { $env:AZURE_DEVOPS_EXT_PAT }),
     [switch] $Ascending,
     [string] $CsvPath
 )
@@ -59,6 +61,10 @@ else {
     $headers = @{ Authorization = "Bearer $aadToken" }
 }
 
+# Without this, a rejected token gets a redirect to an HTML sign-in page
+# instead of a 401, which would read as "no history" rather than an error.
+$headers['X-TFS-FedAuthRedirect'] = 'Suppress'
+
 function Invoke-AzDo([string] $Url) {
     Invoke-RestMethod -Uri $Url -Headers $headers -Method Get
 }
@@ -80,6 +86,7 @@ $results = foreach ($proj in $projects) {
 
     foreach ($ep in $endpoints) {
         $last = $null
+        $historyError = $false
         try {
             # History is returned newest first, so $top=1 is the last use
             $history = Invoke-AzDo ("$baseUrl/$projEnc/_apis/serviceendpoint/$($ep.id)" +
@@ -88,6 +95,7 @@ $results = foreach ($proj in $projects) {
         }
         catch {
             Write-Warning "Could not read history for '$($ep.name)' in '$proj': $($_.Exception.Message)"
+            $historyError = $true
         }
 
         $lastUsed = $null
@@ -104,7 +112,7 @@ $results = foreach ($proj in $projects) {
             DaysSinceUse   = if ($lastUsed) { [int]((Get-Date) - $lastUsed).TotalDays } else { $null }
             LastPipeline   = $last.data.definition.name
             LastRunBy      = $last.data.owner.name
-            LastResult     = $last.data.result
+            LastResult     = if ($historyError) { 'ERROR' } else { $last.data.result }
             IsShared       = $ep.isShared
             Id             = $ep.id
         }

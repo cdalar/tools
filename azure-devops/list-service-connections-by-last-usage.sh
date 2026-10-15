@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 #
 # List Azure DevOps service connections ordered by last usage date.
-# Uses only the Azure CLI (with the azure-devops extension) and your
-# existing `az login` session.
+# Uses only the Azure CLI (with the azure-devops extension).
+#
+# Auth: set AZURE_DEVOPS_EXT_PAT to a PAT with "Service Connections (Read)",
+# plus "Project and Team (Read)" when -p is omitted. It's the same variable
+# `az devops` reads. Or leave it unset to use your
+# `az login` token. If the organization rejects that token (e.g. one backed
+# by a personal Microsoft account), use a PAT.
 #
 # Usage:
 #   ./list-service-connections-by-last-usage.sh -o <org> [-p <project>] [-a] [-c out.csv]
@@ -25,7 +30,7 @@ while getopts "o:p:ac:h" opt; do
     p) PROJECT=$OPTARG ;;
     a) ASC=1 ;;
     c) CSV=$OPTARG ;;
-    *) sed -n '2,18p' "$0"; exit 1 ;;
+    *) awk 'NR > 1 { if (!/^#/) exit; print }' "$0"; exit 1 ;;
   esac
 done
 [[ -z $ORG ]] && { echo "Error: -o <organization> is required" >&2; exit 1; }
@@ -37,6 +42,26 @@ SEP=$'\x1f'                                           # field separator safe for
 # Make sure the azure-devops extension is present
 az extension show --name azure-devops >/dev/null 2>&1 \
   || az extension add --name azure-devops --only-show-errors
+
+rows=$(mktemp); headers=$(mktemp)          # mktemp files are private (0600)
+trap 'rm -f "$rows" "$headers"' EXIT
+
+# Calls with no dedicated az devops command go through az rest. The PAT is
+# passed in a headers file so it never shows up in the process list.
+# Suppressing the sign-in redirect makes a rejected token fail with 401
+# instead of returning an HTML login page that looks like empty history.
+auth=(--resource "$ADO_RESOURCE")
+if [[ -n ${AZURE_DEVOPS_EXT_PAT:-} ]]; then
+  auth=(--skip-authorization-header)
+  printf '{"X-TFS-FedAuthRedirect":"Suppress","Authorization":"Basic %s"}' \
+    "$(printf ':%s' "$AZURE_DEVOPS_EXT_PAT" | base64 | tr -d '\n')" > "$headers"
+else
+  printf '{"X-TFS-FedAuthRedirect":"Suppress"}' > "$headers"
+fi
+
+ado_get() {   # $1 URL, $2 JMESPath query; prints TSV
+  az rest --method get "${auth[@]}" --headers "@$headers" --url "$1" --query "$2" -o tsv
+}
 
 # Days between an ISO-8601 timestamp and now (GNU date, then BSD/macOS date)
 days_since() {
@@ -64,11 +89,23 @@ else
   while IFS= read -r p; do
     [[ -n $p ]] && projects+=("$p")
   done < <(az devops project list --org "$ORG_URL" --query "value[].name" -o tsv)
-  (( ${#projects[@]} )) || { echo "Error: no projects found in $ORG_URL" >&2; exit 1; }
+  (( ${#projects[@]} )) || { echo "Error: could not list projects in $ORG_URL" >&2; exit 1; }
 fi
 
-rows=$(mktemp)
-trap 'rm -f "$rows"' EXIT
+# Check the REST credentials once, on the API the scan needs, so a rejected
+# token stops here instead of making every connection look unused.
+if ! ado_get "$ORG_URL/$(urlencode "${projects[0]}")/_apis/serviceendpoint/endpoints?\$top=1&api-version=7.1" \
+     "count" >/dev/null 2>&1; then
+  echo "Error: $ORG_URL rejected the REST API credentials." >&2
+  if [[ -n ${AZURE_DEVOPS_EXT_PAT:-} ]]; then
+    echo "Check that AZURE_DEVOPS_EXT_PAT is valid for this organization and has" >&2
+    echo "the Service Connections (Read) scope." >&2
+  else
+    echo "Run 'az login', or set AZURE_DEVOPS_EXT_PAT to a PAT if this org does" >&2
+    echo "not accept az login tokens (e.g. one backed by a personal Microsoft account)." >&2
+  fi
+  exit 1
+fi
 
 for proj in "${projects[@]}"; do
   echo "Scanning project: $proj" >&2
@@ -77,15 +114,22 @@ for proj in "${projects[@]}"; do
   while IFS="$SEP" read -r id name type; do
     [[ -z $id ]] && continue
 
-    # Most recent execution of this connection (history is newest first).
-    # There is no dedicated az devops command for this, so az rest is used.
-    hist=$(az rest --method get --resource "$ADO_RESOURCE" \
-      --url "$ORG_URL/$proj_enc/_apis/serviceendpoint/$id/executionhistory?\$top=1&api-version=7.1-preview.1" \
-      --query "value[0].data.[finishTime || startTime, definition.name, result]" \
-      -o tsv 2>/dev/null | tr '\t' "$SEP") || hist=""
-
-    IFS="$SEP" read -r last pipeline result <<< "$hist" || true
-    [[ $last == "None" ]] && last=""
+    # Most recent execution of this connection (history is newest first)
+    last="" pipeline="" result="" ok=1
+    if hist=$(ado_get \
+        "$ORG_URL/$proj_enc/_apis/serviceendpoint/$id/executionhistory?\$top=1&api-version=7.1-preview.1" \
+        "value[0].data.[finishTime || startTime, definition.name, result]" 2>/dev/null); then
+      IFS="$SEP" read -r last pipeline result <<< "$(tr '\t' "$SEP" <<< "$hist")" || true
+      [[ $last == "None" ]] && last=""
+      [[ -z $last || $last == [0-9]* ]] || ok=0
+    else
+      ok=0
+    fi
+    # Never report a connection whose history couldn't be read as unused
+    if (( ! ok )); then
+      echo "Warning: could not read usage history of '$name' in '$proj'" >&2
+      last="" pipeline="" result="ERROR"
+    fi
     days=""; [[ -n $last ]] && days=$(days_since "$last")
 
     printf '%s\n' "${last:0:19}$SEP$days$SEP$proj$SEP$name$SEP$type$SEP${pipeline}$SEP${result}" >> "$rows"
@@ -103,8 +147,10 @@ fi
 # Pretty table
 {
   echo "LAST_USED${SEP}DAYS${SEP}PROJECT${SEP}NAME${SEP}TYPE${SEP}LAST_PIPELINE${SEP}RESULT"
-  if [[ -n $sorted ]]; then sed "s/^$SEP/never$SEP/" <<< "$sorted"; fi
-} | awk -F "$SEP" -v OFS=$'\t' '{ $1=$1; for (i=1;i<=NF;i++) if ($i=="") $i="-"; print }' \
+  if [[ -n $sorted ]]; then printf '%s\n' "$sorted"; fi
+} | awk -F "$SEP" -v OFS=$'\t' '
+    NR > 1 && $1 == "" { $1 = ($7 == "ERROR") ? "unknown" : "never" }
+    { $1=$1; for (i=1;i<=NF;i++) if ($i=="") $i="-"; print }' \
   | if command -v column >/dev/null; then column -t -s $'\t'; else cat; fi
 
 # Optional CSV

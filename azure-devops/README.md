@@ -11,11 +11,20 @@ Both scripts produce the same report; pick the one that fits your shell.
 
 | Script | Runs on | Auth |
 | --- | --- | --- |
-| `list-service-connections-by-last-usage.sh` | Bash (macOS / Linux) | `az login` |
-| `Get-ServiceConnectionsByLastUsage.ps1` | PowerShell 7+ | `AZDO_PAT`, or `az login` |
+| `list-service-connections-by-last-usage.sh` | Bash (macOS / Linux) | `AZURE_DEVOPS_EXT_PAT`, or `az login` |
+| `Get-ServiceConnectionsByLastUsage.ps1` | PowerShell 7+ | `-Pat` / `AZDO_PAT` / `AZURE_DEVOPS_EXT_PAT`, or `az login` |
 
-Both need read access to service connections in the projects you scan
-(a PAT needs the **Service Connections (Read)** scope).
+### Auth
+
+- **PAT**: needs **Service Connections (Read)**, plus **Project and Team (Read)**
+  when scanning a whole organization (no project given).
+- **`az login`**: used when no PAT is set. Some organizations reject this token
+  for REST calls, notably ones backed by a personal Microsoft account (even when
+  `az devops` commands still work through a stored PAT). Use a PAT there.
+
+If the credentials are rejected, the scripts stop with an error rather than
+reporting connections as never used. A connection whose history can't be
+read is shown with result `ERROR` (and `unknown` as the last use in Bash).
 
 ### Bash
 
