@@ -4,9 +4,13 @@ on:
   pull_request:
     branches:    
       - 'main'
+    paths:
+      - 'images/**'
   push:
     branches:
       - 'main'
+    paths:
+      - 'images/**'
 
 jobs:
   docker:
