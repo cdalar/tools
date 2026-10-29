@@ -39,3 +39,17 @@ https://<rancher>/k8s/clusters/<cluster-id>/api/v1/namespaces/cattle-system/pods
 Opening the URL needs the `pods/proxy` permission in `cattle-system` (cluster admins have it). It is read-only: it only
 runs `kubectl get nodes,pods` and `kubectl top`, and serves no files. Usage needs metrics-server. If the cluster ID or
 Rancher URL can't be detected, set `K_CLUSTER_ID` / `K_RANCHER_URL`.
+
+## Rancher edition (`k8s-funcs-rancher.sh`)
+The same functions as `k8s-funcs.sh` (use one file or the other, they define the same names), plus:
+- **N+1**: room left for workloads if the largest schedulable node fails, after platform components. Shown in the
+  `k-serve` dashboard (tile, dashed line on the capacity bars, the calculation) and as a summary line in `k-nodemem`.
+- **Rancher project names**: downstream clusters only know each namespace's project ID. The dashboard first asks the
+  Rancher API for the names, through your browser session. If that is not allowed, run `k-projects` in the Rancher
+  local cluster's shell and paste the `echo '…' > ~/rancher-projects.json` line it prints into the downstream
+  cluster's shell before `k-serve`. One export covers all clusters. Names give a Project column, charts by project,
+  and the System project counts as platform for N+1.
+
+```
+curl -fsSLo ~/k8s-funcs-rancher.sh https://raw.githubusercontent.com/cdalar/tools/main/k8s-funcs-rancher.sh && source ~/k8s-funcs-rancher.sh
+```
