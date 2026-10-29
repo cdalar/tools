@@ -15,7 +15,7 @@
 #   k-nstotals [key]               per namespace: pods, memory and CPU requests and limits, % of cluster; total last
 #   k-nsreq <namespace> [key]      workloads in a namespace: pods, requests per pod and in total (% of namespace), limits per pod
 #   k-events [ns|all] [severity]   important problems: OOM kills, quota, unschedulable pods, crash loops, images,
-#                                  volumes, evictions, node pressure (default all namespaces, medium and up)
+#                                  volumes, evictions, node pressure (default all namespaces, high and up)
 #   k-nodereport [namespace]       per node: pods, memory allocatable / requested / limits / used, CPU requested / limits / used;
 #                                  with a namespace, also that namespace's pods and memory request per node
 #   k-projects [file]              (Rancher local cluster) export project names for k-serve to ~/rancher-projects.json
@@ -341,10 +341,10 @@ _K8S_EVENTS_DEFS='
 
 # Important problems: OOM kills, quota errors and quotas at 90%+, unschedulable pods, crash loops, image pulls,
 # volumes, evictions, node pressure, probes, autoscaling. Most severe first, then most recent.
-# Usage: k-events [namespace|all] [critical|high|medium|low]   (default: all namespaces, medium and up)
+# Usage: k-events [namespace|all] [critical|high|medium|low]   (default: all namespaces, high and up)
 k-events() {
   _k8s_need || return 1
-  local ns="${1:-all}" min="${2:-medium}" color=0
+  local ns="${1:-all}" min="${2:-high}" color=0
   local -a scope
   case "$min" in critical|high|medium|low) ;; *) echo "usage: k-events [namespace|all] [critical|high|medium|low]" >&2; return 1 ;; esac
   if [ "$ns" = all ]; then scope=(-A); else scope=(-n "$ns"); fi

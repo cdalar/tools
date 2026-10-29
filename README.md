@@ -20,7 +20,8 @@ limits over 100% of allocatable are flagged with `!`.
 Unschedulable nodes (cordoned, or tainted `NoSchedule`/`NoExecute` like control-plane nodes) are marked `*` and left out of totals.
 Needs `kubectl`, `jq`, `awk` (bash).
 
-`k-events [namespace|all] [critical|high|medium|low]` lists what needs attention, most severe first: OOM kills,
+`k-events [namespace|all] [critical|high|medium|low]` (default: all namespaces, high and up) lists what needs
+attention, most severe first: OOM kills,
 quota errors and quotas at 90%+, unschedulable pods, crash loops, image pulls, volume mounts, evictions, node
 pressure, failing probes and autoscaling. Besides events (which expire after about an hour) it reads pod status, so
 OOMKilled containers and crash loops show up even when no event exists, and ResourceQuota usage. `k-serve` shows the same findings in a
