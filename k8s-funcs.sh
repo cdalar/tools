@@ -13,6 +13,7 @@
 #   k-nsreq <namespace> [key]      workloads in a namespace: pods, requests per pod and in total (% of namespace), limits per pod
 #   k-nodereport [namespace]       per node: pods, memory allocatable / requested / limits / used, CPU requested / limits / used;
 #                                  with a namespace, also that namespace's pods and memory request per node
+#   k-projects [file]              (Rancher local cluster) export project names for k-serve to ~/rancher-projects.json
 #   k-serve [port]                 live dashboard in the browser (charts, tables; default port 8080), served from this pod;
 #                                  prints the Rancher URL that reaches it through the API server's pod proxy
 # key (sort order): mem | cpu | memlim | cpulim
@@ -70,6 +71,7 @@ k-nsreq <namespace> [key]      workloads in a namespace: requests per pod and in
 k-nodereport [namespace]       per node: memory alloc/requested/limits/used, CPU requested/limits/used (+ namespace share)
 key (sort order): mem | cpu | memlim | cpulim
 * = unschedulable node (cordoned / NoSchedule / NoExecute), left out of totals
+k-projects [file]              (Rancher local cluster) export project names for k-serve to ~/rancher-projects.json
 k-serve [port]                 live dashboard in the browser (default 8080); prints its Rancher proxy URL
 EOF
 }
@@ -261,7 +263,8 @@ k-nodereport() {
 # ---------- k-serve: live dashboard in the browser through the Rancher pod proxy ----------
 
 # jq for k-serve's api/data: nodes and pods (Running and Pending) with requests, limits and metrics-server usage.
-# Input: kubectl get nodes,pods -A -o json; $topn / $topp: kubectl top nodes / pods -A --no-headers.
+# Input: kubectl get nodes,pods,namespaces -A -o json; $topn / $topp: kubectl top nodes / pods -A --no-headers;
+# $projects: the JSON from k-projects (Rancher project id -> display name), or empty.
 _K8S_DASH_JQ='
   ($topn | split("\n") | map(select(length > 0) | [splits(" +")])
          | map({key: .[0], value: {cpu: (.[1] | millicores), mem: (.[3] | bytes)}}) | from_entries) as $un
@@ -277,6 +280,9 @@ _K8S_DASH_JQ='
          no_cpu_req: ([.spec.containers[] | select(.resources.requests.cpu == null)] | length),
          no_mem_lim: ([.spec.containers[] | select(.resources.limits.memory == null)] | length)}] as $pods
   | {collected_at: (now | todate), cluster: $cluster, metrics: ($un | length > 0), pods: $pods,
+     ns_projects: ([.items[] | select(.kind == "Namespace")
+                    | {key: .metadata.name, value: (.metadata.annotations["field.cattle.io/projectId"] // "")}] | from_entries),
+     projects: (try ($projects | fromjson) catch {}),
      nodes: [.items[] | select(.kind == "Node") | .metadata.name as $n
        | ($pods | map(select(.node == $n and .phase == "Running"))) as $p
        | {name: $n, sched: schedulable,
@@ -296,8 +302,10 @@ set -o pipefail
 t="$K_SERVE_DIR"
 kubectl top nodes --no-headers > "$t/topn" 2>/dev/null || : > "$t/topn"
 kubectl top pods -A --no-headers > "$t/topp" 2>/dev/null || : > "$t/topp"
-kubectl get nodes,pods -A -o json \
-  | jq -c --rawfile topn "$t/topn" --rawfile topp "$t/topp" --arg cluster "$K_SERVE_CLUSTER" "$K_SERVE_JQ"
+{ [ -n "$K_SERVE_PROJECTS" ] && cat "$K_SERVE_PROJECTS" 2>/dev/null; } > "$t/projects"
+kubectl get nodes,pods,namespaces -A -o json \
+  | jq -c --rawfile topn "$t/topn" --rawfile topp "$t/topp" --rawfile projects "$t/projects" \
+       --arg cluster "$K_SERVE_CLUSTER" "$K_SERVE_JQ"
 '
 
 # HTTP server for k-serve: GET / (the dashboard page) and GET api/data (collector output, cached 10 s;
@@ -393,7 +401,7 @@ h2 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
 .sub { color: var(--text-secondary); font-size: 13px; }
 .muted { color: var(--text-muted); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-button, input[type=search] { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
+button, select, input[type=search] { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
 button { cursor: pointer; }
 button:hover { background: var(--hover); }
 button:disabled { opacity: .5; cursor: default; }
@@ -413,6 +421,7 @@ button:disabled { opacity: .5; cursor: default; }
 .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0 16px; }
 .chip { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; background: var(--surface-1); cursor: pointer; user-select: none; font-size: 13px; }
 .chip input { margin: 0; }
+.chip select { padding: 1px 4px; }
 svg { display: block; max-width: 100%; height: auto; }
 svg text { fill: var(--text-secondary); font-size: 12px; }
 svg .val { fill: var(--text-primary); font-variant-numeric: tabular-nums; }
@@ -484,16 +493,17 @@ tr.selected { background: var(--hover); }
 
   <div class="filters" role="group" aria-label="Filters">
     <label class="chip"><input type="checkbox" id="sys" checked> System namespaces</label>
+    <label class="chip" id="groupWrap" hidden>Charts by <select id="group" aria-label="Group charts by"><option value="ns">namespace</option><option value="project">project</option></select></label>
     <input type="search" id="search" placeholder="Filter namespaces / pods" aria-label="Filter namespaces and pods">
   </div>
 
   <div class="grid2">
     <div class="card">
-      <div class="section-head"><div><h2>CPU by namespace</h2><div class="sub">vCPU · top 15 by requests · click to see its pods</div></div><div class="legend" id="nsCpuLegend"></div></div>
+      <div class="section-head"><div><h2 id="nsCpuTitle">CPU by namespace</h2><div class="sub">vCPU · top 15 by requests · click for details</div></div><div class="legend" id="nsCpuLegend"></div></div>
       <div id="nsCpu"></div>
     </div>
     <div class="card">
-      <div class="section-head"><div><h2>Memory by namespace</h2><div class="sub">GiB · top 15 by requests · click to see its pods</div></div><div class="legend" id="nsMemLegend"></div></div>
+      <div class="section-head"><div><h2 id="nsMemTitle">Memory by namespace</h2><div class="sub">GiB · top 15 by requests · click for details</div></div><div class="legend" id="nsMemLegend"></div></div>
       <div id="nsMem"></div>
     </div>
   </div>
@@ -526,7 +536,7 @@ tr.selected { background: var(--hover); }
 const $ = (s) => document.querySelector(s);
 const GIB = 1073741824, MIB = 1048576;
 const SYSTEM_NS = /^(kube-|cattle-|fleet-|calico-|tigera-|rancher-|longhorn-|ingress-|cert-manager$)|-system$/;
-const state = { data: null, d: null, err: null, q: "", sys: true, ns: null, busy: false,
+const state = { data: null, d: null, err: null, q: "", sys: true, ns: null, busy: false, group: "ns",
                 sort: { nodes: ["mem_req_pct", -1], ns: ["cpu_req", -1], pods: ["mem_req", -1] } };
 
 // ---------- formatting ----------
@@ -593,6 +603,38 @@ function attachTip(node, fn) {
   node.addEventListener("blur", hideTip);
 }
 
+// ---------- Rancher projects ----------
+// A namespace's project id comes from its field.cattle.io/projectId annotation. Its name comes from the Rancher API
+// (this page is served from the Rancher host, so the browser's session works), else from the k-projects export,
+// else the bare id. Namespaces in the "System" project, or matching SYSTEM_NS, are platform components.
+let apiProjects = null;
+function projectOf(ns) {
+  const id = (state.data.ns_projects || {})[ns] || "";
+  if (!id) return { id: "", name: "" };
+  return { id, name: (apiProjects && apiProjects[id]) || (state.data.projects || {})[id] || id.split(":").pop() };
+}
+const isSystem = (ns) => SYSTEM_NS.test(ns) || projectOf(ns).name === "System";
+const hasProjects = () => Object.values(state.data.ns_projects || {}).some(Boolean);
+function projectSource() {
+  if (!hasProjects()) return "";
+  if (apiProjects && Object.keys(apiProjects).length) return "project names from Rancher";
+  if (Object.keys(state.data.projects || {}).length) return "project names from k-projects export";
+  return "project ids only (run k-projects on the Rancher local cluster)";
+}
+async function loadApiProjects() {
+  apiProjects = {};
+  if (!state.data.cluster || !location.pathname.startsWith("/k8s/clusters/")) return;
+  try {
+    const res = await fetch(`/v3/projects?clusterId=${encodeURIComponent(state.data.cluster)}&limit=-1`,
+                            { credentials: "same-origin", headers: { Accept: "application/json" } });
+    if (!res.ok) return;
+    const body = await res.json();
+    apiProjects = Object.fromEntries((body.data || []).map((p) => [p.id, p.name]));
+    state.d = derive(state.data);
+    render();
+  } catch (e) { /* not reachable or not allowed: fall back to the export */ }
+}
+
 // ---------- derived data ----------
 function derive(data) {
   const sum = (arr, k) => arr.reduce((a, x) => a + (x[k] || 0), 0);
@@ -614,7 +656,7 @@ function derive(data) {
   // first, the rest is what workloads can safely request
   const onSched = new Set(sched.map((n) => n.name));
   const schedPods = running.filter((p) => onSched.has(p.node));
-  const sys = schedPods.filter((p) => SYSTEM_NS.test(p.ns)), work = schedPods.filter((p) => !SYSTEM_NS.test(p.ns));
+  const sys = schedPods.filter((p) => isSystem(p.ns)), work = schedPods.filter((p) => !isSystem(p.ns));
   Object.assign(c, {
     cpu_req_sys: sum(sys, "cpu_req"), mem_req_sys: sum(sys, "mem_req"),
     cpu_req_work: sum(work, "cpu_req"), mem_req_work: sum(work, "mem_req"),
@@ -627,7 +669,7 @@ function derive(data) {
   const keys = ["cpu_req", "cpu_lim", "cpu_used", "mem_req", "mem_lim", "mem_used", "no_cpu_req", "no_mem_lim"];
   for (const p of data.pods) {
     let r = byNs.get(p.ns);
-    if (!r) { r = { ns: p.ns, sys: SYSTEM_NS.test(p.ns), pods: 0, pending: 0 }; keys.forEach((k) => { r[k] = 0; }); byNs.set(p.ns, r); }
+    if (!r) { r = { ns: p.ns, project: projectOf(p.ns).name, sys: isSystem(p.ns), pods: 0, pending: 0 }; keys.forEach((k) => { r[k] = 0; }); byNs.set(p.ns, r); }
     if (p.phase === "Pending") { r.pending++; continue; }
     r.pods++;
     keys.forEach((k) => { r[k] += p[k] || 0; });
@@ -635,11 +677,11 @@ function derive(data) {
   return { c, ns: [...byNs.values()] };
 }
 const matches = (...fields) => !state.q || fields.some((f) => String(f || "").toLowerCase().includes(state.q));
-const nsVisible = (ns) => (state.sys || !SYSTEM_NS.test(ns));
+const nsVisible = (ns) => (state.sys || !isSystem(ns));
 const filteredNs = () => state.d.ns.filter((r) => nsVisible(r.ns) &&
-  (matches(r.ns) || state.data.pods.some((p) => p.ns === r.ns && matches(p.name))));
+  (matches(r.ns, r.project) || state.data.pods.some((p) => p.ns === r.ns && matches(p.name))));
 function filteredPods() {
-  return state.data.pods.filter((p) => state.ns ? p.ns === state.ns : nsVisible(p.ns) && matches(p.ns, p.name, p.node, p.owner));
+  return state.data.pods.filter((p) => state.ns ? p.ns === state.ns : nsVisible(p.ns) && matches(p.ns, p.name, p.node, p.owner, projectOf(p.ns).name));
 }
 
 // ---------- header, banners, tiles ----------
@@ -649,6 +691,7 @@ function renderMeta() {
     parts.push(state.data.cluster || "current cluster");
     parts.push(`${state.data.nodes.length} nodes · ${f0.format(state.data.pods.length)} pods`);
     parts.push(`updated ${ago(state.data.collected_at)} (${new Date(state.data.collected_at).toLocaleTimeString()})`);
+    if (projectSource()) parts.push(projectSource());
   }
   if (state.busy) parts.push("refreshing…");
   $("#meta").textContent = parts.join(" · ") || "Loading…";
@@ -788,7 +831,7 @@ function renderN1Note(c) {
   }
   $("#capNote").replaceChildren(
     el("b", { text: "N+1 (dashed line): " }),
-    "the capacity left if the largest schedulable node fails. Platform components (system namespaces: kube-*, cattle-*, *-system, ingress, …) " +
+    "the capacity left if the largest schedulable node fails. Platform components (the Rancher System project and system namespaces: kube-*, cattle-*, *-system, ingress, …) " +
       "come off first; the rest is what workloads can safely request." + notCounted,
     el("br"), line("CPU", "vCPU", vcpu(c.cpu_alloc), vcpu(c.largest_cpu), vcpu(c.cpu_n1), vcpu(c.cpu_req_sys), vcpu(c.cpu_room), vcpu(c.cpu_req_work)),
     el("br"), line("Memory", "GiB", gib(c.mem_alloc), gib(c.largest_mem), gib(c.mem_n1), gib(c.mem_req_sys), gib(c.mem_room), gib(c.mem_req_work)),
@@ -848,16 +891,36 @@ function renderNodeChart(target, legendTarget, kind) {
   })), { aColor: "var(--series-1)", bColor: "var(--series-2)", ref: 100, unitTick: "%", ariaLabel: `${kind} by node` });
 }
 
+// namespaces summed per Rancher project ("(no project)" for the rest)
+function byProject(rows) {
+  const out = new Map();
+  for (const r of rows) {
+    const k = r.project || "(no project)";
+    let g = out.get(k);
+    if (!g) { g = { label: k, project: r.project, namespaces: 0 }; out.set(k, g); }
+    g.namespaces++;
+    for (const [f, v] of Object.entries(r)) if (typeof v === "number") g[f] = (g[f] || 0) + v;
+  }
+  return [...out.values()];
+}
+function filterProject(name) {
+  state.q = name.toLowerCase(); state.ns = null;
+  $("#search").value = name;
+  render();
+}
 function renderNsChart(target, legendTarget, kind) {
   const m = state.data.metrics, conv = kind === "cpu" ? vcpu : gib, unit = kind === "cpu" ? "vCPU" : "GiB";
-  const second = m ? "used" : "lim";
+  const second = m ? "used" : "lim", grouped = state.group === "project";
+  $(target + "Title").textContent = `${kind === "cpu" ? "CPU" : "Memory"} by ${grouped ? "project" : "namespace"}`;
   legend(legendTarget, [["var(--series-1)", "Requested"], ["var(--series-2)", m ? "Used now" : "Limits"]]);
-  const rows = filteredNs().sort((a, b) => b[`${kind}_req`] - a[`${kind}_req`]).slice(0, 15);
+  const all = grouped ? byProject(filteredNs()) : filteredNs().map((r) => ({ ...r, label: r.ns }));
+  const rows = all.sort((a, b) => b[`${kind}_req`] - a[`${kind}_req`]).slice(0, 15);
   hbars($(target), rows.map((r) => ({
-    label: r.ns, a: conv(r[`${kind}_req`]), b: conv(r[`${kind}_${second}`]),
+    label: r.label, a: conv(r[`${kind}_req`]), b: conv(r[`${kind}_${second}`]),
     valText: smart(conv(r[`${kind}_req`])),
-    onClick: () => selectNs(r.ns),
+    onClick: grouped ? (r.project ? () => filterProject(r.project) : null) : () => selectNs(r.ns),
     tip: [
+      ...(grouped ? [[null, "Namespaces", f0.format(r.namespaces)]] : r.project ? [[null, "Project", r.project]] : []),
       ["var(--series-1)", "Requested", `${smart(conv(r[`${kind}_req`]))} ${unit}`],
       ...(m ? [["var(--series-2)", "Used now", `${smart(conv(r[`${kind}_used`]))} ${unit}`],
                [null, "Efficiency", r[`${kind}_req`] ? `${num(pct(r[`${kind}_used`], r[`${kind}_req`]), 0)}%` : "–"]] : []),
@@ -930,6 +993,7 @@ function renderNodesTable() {
 function renderNsTable() {
   renderTable($("#nsTable"), "ns", [
     { k: "ns", h: "Namespace", l: true },
+    ...(hasProjects() ? [{ k: "project", h: "Project", l: true, fmt: (r) => r.project || "–" }] : []),
     { k: "pods", h: "Pods", fmt: (r) => f0.format(r.pods) },
     { k: "pending", h: "Pending", cell: (r) => countCell(r.pending, "warning") },
     { k: "cpu_req", h: "CPU req", fmt: (r) => smart(vcpu(r.cpu_req)), title: "vCPU" },
@@ -979,6 +1043,9 @@ function render() {
   renderMeta();
   renderBanners();
   if (!state.data) return;
+  $("#groupWrap").hidden = !hasProjects();
+  if (!hasProjects()) state.group = "ns";
+  $("#group").value = state.group;
   renderTiles();
   renderCapacity();
   renderNodeChart("#nodeCpu", "#nodeCpuLegend", "cpu");
@@ -1001,6 +1068,7 @@ async function load(fresh) {
     const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
     if (!res.ok || body.error) throw new Error(body.error || `HTTP ${res.status}`);
     state.data = body; state.d = derive(body); state.err = null;
+    if (apiProjects === null) loadApiProjects();
   } catch (e) {
     state.err = e.message;
   } finally {
@@ -1013,6 +1081,7 @@ async function load(fresh) {
 
 $("#refresh").addEventListener("click", () => load(true));
 $("#auto").addEventListener("change", (e) => { clearTimeout(timer); if (e.target.checked) timer = setTimeout(() => load(false), 30000); });
+$("#group").addEventListener("change", (e) => { state.group = e.target.value; render(); });
 $("#sys").addEventListener("change", (e) => { state.sys = e.target.checked; render(); });
 $("#search").addEventListener("input", (e) => { state.q = e.target.value.trim().toLowerCase(); state.ns = null; render(); });
 $("#clearNs").addEventListener("click", () => selectNs(null));
@@ -1033,11 +1102,25 @@ load(false);
 HTML
 }
 
+# Run on the Rancher local cluster (its kubectl shell): export every Rancher project's display name, for all clusters,
+# as {"<cluster-id>:<project-id>": "<name>"} to ~/rancher-projects.json, and print a command that recreates the file
+# in another shell (paste it into the downstream cluster's shell, then run k-serve there).
+k-projects() {
+  _k8s_need || return 1
+  local out="${1:-$HOME/rancher-projects.json}" json
+  json="$(kubectl get projects.management.cattle.io -A -o json 2>/dev/null \
+    | jq -c 'reduce .items[] as $p ({}; .["\($p.metadata.namespace):\($p.metadata.name)"] = ($p.spec.displayName // $p.metadata.name))')" \
+    && [ -n "$json" ] || { echo "error: cannot read projects.management.cattle.io -- run this in the Rancher local cluster's shell" >&2; return 1; }
+  printf '%s\n' "$json" > "$out"
+  echo "Wrote $(printf '%s' "$json" | jq length) projects to $out. In the other cluster's shell, paste:" >&2
+  printf "echo '%s' > ~/rancher-projects.json\n" "$(printf '%s' "$json" | sed "s/'/'\\\\''/g")"
+}
+
 # Live dashboard (charts, tables) for the current cluster, served from this pod -- the Rancher shell -- and reached
 # through the API server's pod proxy. Foreground; Ctrl-C stops it. Override detection with K_RANCHER_URL / K_CLUSTER_ID.
 k-serve() {
   _k8s_need || return 1
-  local port="${1:-8080}" dir="${TMPDIR:-/tmp}/k-serve-$$" pod ns cid server
+  local port="${1:-8080}" dir="${TMPDIR:-/tmp}/k-serve-$$" pod ns cid server projects="${K_PROJECTS:-$HOME/rancher-projects.json}"
   command -v perl >/dev/null 2>&1 || { echo "error: perl not found in PATH" >&2; return 1; }
   command -v bash >/dev/null 2>&1 || { echo "error: bash not found in PATH" >&2; return 1; }
   mkdir -p "$dir" && _k8s_dash_html > "$dir/index.html" || return 1
@@ -1052,7 +1135,8 @@ k-serve() {
   echo "  ${server:-https://<rancher>}/k8s/clusters/${cid:-<cluster-id>}/api/v1/namespaces/$ns/pods/$pod:$port/proxy/"
   [ -n "$cid" ] || echo "  (cluster id not found: it is the <id> in your browser URL .../dashboard/c/<id>/...; or set K_CLUSTER_ID)"
   [ -n "$server" ] || echo "  (Rancher URL not found: set K_RANCHER_URL=https://your.rancher.host)"
-  K_SERVE_DIR="$dir" K_SERVE_CLUSTER="${cid:-}" K_SERVE_JQ="$_K8S_JQ_DEFS$_K8S_DASH_JQ" K_SERVE_COLLECT="$_K8S_SERVE_COLLECT" \
+  [ -f "$projects" ] && echo "  (Rancher project names from $projects)"
+  K_SERVE_DIR="$dir" K_SERVE_CLUSTER="${cid:-}" K_SERVE_PROJECTS="$projects" K_SERVE_JQ="$_K8S_JQ_DEFS$_K8S_DASH_JQ" K_SERVE_COLLECT="$_K8S_SERVE_COLLECT" \
     perl -e "$_K8S_SERVE_PL" "$port" "$dir"
   rm -rf "$dir"
 }
