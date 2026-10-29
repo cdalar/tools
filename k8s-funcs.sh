@@ -13,6 +13,8 @@
 #   k-nsreq <namespace> [key]      workloads in a namespace: pods, requests per pod and in total (% of namespace), limits per pod
 #   k-nodereport [namespace]       per node: pods, memory allocatable / requested / limits / used, CPU requested / limits / used;
 #                                  with a namespace, also that namespace's pods and memory request per node
+#   k-serve [port] [dir]           serve a directory over HTTP from this pod (default 8080, .) and print the Rancher
+#                                  URL that reaches it through the API server's pod proxy
 # key (sort order): mem | cpu | memlim | cpulim
 #
 # Limits are summed over containers that set one; a container without a limit counts as 0 (and "-" means none set).
@@ -21,6 +23,7 @@
 # of node TOTALs; k-nstotals counts only schedulable nodes and the pods on them.
 #
 # Requires: kubectl, jq, awk, bash or zsh. Usage in k-nodereport needs metrics-server ("n/a" without it).
+# k-serve needs perl (in the Rancher shell image) and the pods/proxy permission to open the URL.
 
 # jq helpers: memory quantities -> bytes, CPU quantities -> millicores, per-pod request and limit sums
 _K8S_JQ_DEFS='
@@ -67,6 +70,7 @@ k-nsreq <namespace> [key]      workloads in a namespace: requests per pod and in
 k-nodereport [namespace]       per node: memory alloc/requested/limits/used, CPU requested/limits/used (+ namespace share)
 key (sort order): mem | cpu | memlim | cpulim
 * = unschedulable node (cordoned / NoSchedule / NoExecute), left out of totals
+k-serve [port] [dir]           serve a directory over HTTP (default 8080, .) and print its Rancher proxy URL
 EOF
 }
 
@@ -245,4 +249,94 @@ k-nodereport() {
             sched:  (if schedulable then 1 else 0 end) } ]
     | sort_by(-.sched, -(if .alloc > 0 then .req/.alloc else 0 end))[]
     | [.node,.pods,.alloc,.req,.lim,.calloc,.creq,.clim,.nspods,.nsreq,.sched] | @tsv')
+}
+
+# Static file server for k-serve: GET/HEAD only, relative links (works behind the /proxy/ prefix),
+# dotfiles and ".." refused so ~/.kube/config is never served.
+_K8S_SERVE_PL='
+use strict; use warnings; use IO::Socket::INET;
+my ($port, $root) = @ARGV;
+$SIG{PIPE} = "IGNORE";
+my $srv = IO::Socket::INET->new(LocalAddr => "0.0.0.0", LocalPort => $port, Listen => 16, ReuseAddr => 1, Proto => "tcp")
+  or die "k-serve: cannot listen on port $port: $!\n";
+my %ct = (html => "text/html", htm => "text/html", css => "text/css", js => "text/javascript", json => "application/json",
+          csv => "text/csv", svg => "image/svg+xml", png => "image/png", jpg => "image/jpeg", jpeg => "image/jpeg",
+          gif => "image/gif", pdf => "application/pdf", gz => "application/gzip", tgz => "application/gzip");
+sub esc { my $s = shift; $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g; $s =~ s/>/&gt;/g; $s =~ s/"/&quot;/g; $s }
+sub uenc { my $s = shift; $s =~ s/([^A-Za-z0-9._~-])/sprintf("%%%02X", ord $1)/ge; $s }
+sub reply {
+  my ($c, $head, $code, $type, $body, $extra) = @_;
+  print $c "HTTP/1.0 $code\r\nContent-Type: $type\r\nContent-Length: " . length($body)
+         . "\r\nCache-Control: no-store\r\nConnection: close\r\n" . ($extra // "") . "\r\n";
+  print $c $body unless $head;
+}
+sub handle {
+  my $c = shift;
+  binmode $c;
+  my $req = <$c> // return;
+  while (my $h = <$c>) { last if $h =~ /^\r?\n$/ }
+  my ($m, $uri) = $req =~ m{^(\S+)\s+(\S+)} or return reply($c, 0, "400 Bad Request", "text/plain", "bad request\n");
+  my $head = $m eq "HEAD";
+  return reply($c, 0, "405 Method Not Allowed", "text/plain", "GET or HEAD only\n") unless $m eq "GET" or $head;
+  (my $path = $uri) =~ s/[?#].*//;
+  $path =~ s/%([0-9A-Fa-f]{2})/chr hex $1/ge;
+  my @seg = grep { length } split m{/}, $path;
+  print STDERR scalar(localtime), " $m $path\n";
+  return reply($c, $head, "403 Forbidden", "text/plain", "forbidden\n") if grep { /^\./ } @seg;
+  my $fs = join "/", $root, @seg;
+  if (-d $fs) {
+    return reply($c, $head, "301 Moved Permanently", "text/plain", "", "Location: " . uenc($seg[-1]) . "/\r\n")
+      if @seg and $path !~ m{/$};
+    $fs .= "/index.html" if -f "$fs/index.html";
+  }
+  if (-d $fs) {
+    opendir my $d, $fs or return reply($c, $head, "403 Forbidden", "text/plain", "forbidden\n");
+    my @e = sort grep { !/^\./ } readdir $d;
+    closedir $d;
+    my $title = esc("/" . join("", map { "$_/" } @seg));
+    my $html = "<!doctype html><meta charset=utf-8><title>$title</title>"
+             . "<style>body{font:14px monospace;margin:2em}td{padding:0 1.5em 0 0}</style><h3>$title</h3><table>";
+    $html .= "<tr><td><a href=\"../\">../</a><td>" if @seg;
+    for (@e) {
+      my $dir = -d "$fs/$_" ? "/" : "";
+      $html .= "<tr><td><a href=\"" . uenc($_) . "$dir\">" . esc($_) . "$dir</a><td>" . ($dir ? "" : -s "$fs/$_");
+    }
+    return reply($c, $head, "200 OK", "text/html; charset=utf-8", "$html</table>\n");
+  }
+  return reply($c, $head, "404 Not Found", "text/plain", "not found\n") unless -f $fs;
+  open my $f, "<", $fs or return reply($c, $head, "403 Forbidden", "text/plain", "forbidden\n");
+  binmode $f;
+  my $body = do { local $/; <$f> } // "";
+  close $f;
+  my ($ext) = $fs =~ m{\.([^./]+)$};
+  my $type = $ct{lc($ext // "")} // (-T $fs ? "text/plain" : "application/octet-stream");
+  $type .= "; charset=utf-8" if $type =~ m{^text/};
+  reply($c, $head, "200 OK", $type, $body);
+}
+while (my $c = $srv->accept) {
+  eval { local $SIG{ALRM} = sub { die "timeout\n" }; alarm 30; handle($c); alarm 0; };
+  alarm 0;
+  print STDERR "k-serve: $@" if $@;
+  close $c;
+}
+'
+
+# Serve a directory over HTTP from this pod (the Rancher shell) and print the Rancher URL that reaches it through
+# the API server's pod proxy. Foreground; Ctrl-C stops it. Override detection with K_RANCHER_URL / K_CLUSTER_ID.
+k-serve() {
+  local port="${1:-8080}" dir="${2:-.}" pod ns cid server
+  command -v perl >/dev/null 2>&1 || { echo "error: perl not found in PATH" >&2; return 1; }
+  [ -d "$dir" ] || { echo "error: $dir is not a directory" >&2; return 1; }
+  pod="$(hostname)"
+  ns="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo cattle-system)"
+  # Rancher puts every namespace in a project, annotated "<cluster-id>:<project-id>"
+  cid="${K_CLUSTER_ID:-$(kubectl get ns "$ns" -o jsonpath='{.metadata.annotations.field\.cattle\.io/projectId}' 2>/dev/null | cut -d: -f1)}"
+  server="${K_RANCHER_URL:-$(kubectl -n cattle-system get deploy cattle-cluster-agent \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CATTLE_SERVER")].value}' 2>/dev/null)}"
+  [ -n "$server" ] || server="$(kubectl get settings.management.cattle.io server-url -o jsonpath='{.value}' 2>/dev/null)"
+  echo "Serving $(cd "$dir" && pwd) on port $port (Ctrl-C to stop). Open:"
+  echo "  ${server:-https://<rancher>}/k8s/clusters/${cid:-<cluster-id>}/api/v1/namespaces/$ns/pods/$pod:$port/proxy/"
+  [ -n "$cid" ] || echo "  (cluster id not found: it is the <id> in your browser URL .../dashboard/c/<id>/...; or set K_CLUSTER_ID)"
+  [ -n "$server" ] || echo "  (Rancher URL not found: set K_RANCHER_URL=https://your.rancher.host)"
+  perl -e "$_K8S_SERVE_PL" "$port" "$dir"
 }
