@@ -13,8 +13,10 @@ Tools for Cloud
 
 ## Kubernetes resource reports (`k8s-funcs.sh`)
 Read-only kubectl + jq helpers, all prefixed `k-` (type `k-<TAB>`, or `k-help`):
-`k-toppods [N] [mem|cpu]`, `k-nodemem`, `k-nstotals [mem|cpu]`, `k-nsreq <ns> [mem|cpu]`, `k-nodereport [ns]`.
-Each shows memory and CPU requests with percentages (of node / cluster allocatable / namespace total).
+`k-toppods [N] [key]`, `k-nodemem`, `k-nstotals [key]`, `k-nsreq <ns> [key]`, `k-nodereport [ns]`
+(key: `mem`, `cpu`, `memlim`, `cpulim`).
+Each shows memory and CPU requests and limits with percentages (of node / cluster allocatable / namespace total);
+limits over 100% of allocatable are flagged with `!`.
 Needs `kubectl`, `jq`, `awk` (bash).
 
 In a Rancher "Kubectl Shell" (or anywhere), either download it:
