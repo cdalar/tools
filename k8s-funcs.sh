@@ -124,9 +124,15 @@ k-nodemem() {
                    "NODE","PODS","MEM_REQ","MEM_LIM","MEM_ALLOC","REQ%","LIM%","CPU_REQ","CPU_LIM","CPU_ALLOC","REQ%","LIM%"}
       {row($1 ($9 ? "" : "*"),$2,$3,$4,$5,$6,$7,$8)
        if (!$9) { nx++; next }
-       tp+=$2; tm+=$3; tml+=$4; ta+=$5; tc+=$6; tcl+=$7; tca+=$8}
+       tp+=$2; tm+=$3; tml+=$4; ta+=$5; tc+=$6; tcl+=$7; tca+=$8; ns_++
+       if ($5 > bigm) bigm=$5; if ($8 > bigc) bigc=$8}
       END{row("TOTAL",tp,tm,tml,ta,tc,tcl,tca)
-          if (nx) printf "* not schedulable (cordoned or NoSchedule/NoExecute taint), not in TOTAL: %d node(s)\n", nx}'
+          if (nx) printf "* not schedulable (cordoned or NoSchedule/NoExecute taint), not in TOTAL: %d node(s)\n", nx
+          # N+1: what is left if the largest schedulable node fails, against everything requested on schedulable nodes
+          if (ns_ < 2) { print "N+1: only one schedulable node, nothing survives a node failure"; exit }
+          printf "N+1 (largest node fails): memory %s left for %s requested (%s), CPU %s left for %s requested (%s)\n",
+                 mi(ta-bigm), mi(tm), (tm <= ta-bigm ? "fits" : "short by " mi(tm-(ta-bigm))),
+                 mc(tca-bigc), mc(tc), (tc <= tca-bigc ? "fits" : "short by " mc(tc-(tca-bigc)))}'
 }
 
 # Per namespace: pods, memory and CPU requests and limits, as % of the cluster's allocatable; cluster total last.
@@ -604,6 +610,19 @@ function derive(data) {
     pods: running.length, pending: pending.length, pend_cpu: sum(pending, "cpu_req"), pend_mem: sum(pending, "mem_req"),
     containers: sum(running, "containers"), no_cpu_req: sum(running, "no_cpu_req"), no_mem_lim: sum(running, "no_mem_lim"),
   };
+  // N+1: capacity left if the largest schedulable node fails; platform components (system namespaces) come off
+  // first, the rest is what workloads can safely request
+  const onSched = new Set(sched.map((n) => n.name));
+  const schedPods = running.filter((p) => onSched.has(p.node));
+  const sys = schedPods.filter((p) => SYSTEM_NS.test(p.ns)), work = schedPods.filter((p) => !SYSTEM_NS.test(p.ns));
+  Object.assign(c, {
+    cpu_req_sys: sum(sys, "cpu_req"), mem_req_sys: sum(sys, "mem_req"),
+    cpu_req_work: sum(work, "cpu_req"), mem_req_work: sum(work, "mem_req"),
+    largest_cpu: Math.max(0, ...sched.map((n) => n.cpu_alloc)), largest_mem: Math.max(0, ...sched.map((n) => n.mem_alloc)),
+  });
+  c.cpu_n1 = c.cpu_alloc - c.largest_cpu; c.mem_n1 = c.mem_alloc - c.largest_mem;
+  c.cpu_room = c.cpu_n1 - c.cpu_req_sys; c.mem_room = c.mem_n1 - c.mem_req_sys;
+  c.n1_fits = c.nodesSched >= 2 && c.cpu_req_work <= c.cpu_room && c.mem_req_work <= c.mem_room;
   const byNs = new Map();
   const keys = ["cpu_req", "cpu_lim", "cpu_used", "mem_req", "mem_lim", "mem_used", "no_cpu_req", "no_mem_lim"];
   for (const p of data.pods) {
@@ -661,6 +680,11 @@ function renderTiles() {
     tile("Allocatable (schedulable nodes)", smart(vcpu(c.cpu_alloc)), "vCPU", `${smart(gib(c.mem_alloc))} GiB · ${c.nodesSched} of ${c.nodes} nodes`),
     tile("CPU requested", `${num(pct(c.cpu_req, c.cpu_alloc), 0)}%`, "", `${smart(vcpu(c.cpu_req))} of ${smart(vcpu(c.cpu_alloc))} vCPU`),
     tile("Memory requested", `${num(pct(c.mem_req, c.mem_alloc), 0)}%`, "", `${smart(gib(c.mem_req))} of ${smart(gib(c.mem_alloc))} GiB`),
+    c.nodesSched < 2
+      ? tile("Room for workloads (N+1)", "0", "vCPU", "one schedulable node: nothing survives a node failure", "serious")
+      : tile("Room for workloads (N+1)", smart(vcpu(Math.max(c.cpu_room, 0))), "vCPU",
+          `${smart(gib(Math.max(c.mem_room, 0)))} GiB · workloads request ${smart(vcpu(c.cpu_req_work))} vCPU / ${smart(gib(c.mem_req_work))} GiB`,
+          c.n1_fits ? "good" : "serious"),
     tile("CPU limits", `${num(cpuLim, 0)}%`, "", `${smart(vcpu(c.cpu_lim))} vCPU` + (cpuLim > 100 ? " · overcommitted" : ""), cpuLim > 100 ? "serious" : null),
     tile("Memory limits", `${num(memLim, 0)}%`, "", `${smart(gib(c.mem_lim))} GiB` + (memLim > 100 ? " · overcommitted" : ""), memLim > 100 ? "serious" : null),
     m ? tile("Used now", smart(vcpu(c.cpu_used)), "vCPU", `${smart(gib(c.mem_used))} GiB · ${num(pct(c.cpu_used, c.cpu_alloc), 0)}% CPU / ${num(pct(c.mem_used, c.mem_alloc), 0)}% memory`)
@@ -693,43 +717,82 @@ const truncate = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 function renderCapacity() {
   const c = state.d.c, m = state.data.metrics, box = $("#capacity");
-  legend("#capLegend", [["var(--series-1)", "Requested"], ...(m ? [["var(--series-2)", "Used now", "solid"]] : []), ["var(--track)", "Free"]]);
+  const colors = ["var(--series-1)", "var(--series-2)"], names = ["Workloads", "System (platform)"];
+  legend("#capLegend", [[colors[0], names[0]], [colors[1], names[1]], ...(m ? [["var(--series-3)", "Used now", "solid"]] : []),
+    ["var(--track)", "Free"], ["var(--text-primary)", "If the largest node fails", "dashed"]]);
   const rows = [
-    ["CPU", "vCPU", vcpu(c.cpu_alloc), vcpu(c.cpu_req), m ? vcpu(c.cpu_used) : null, vcpu(c.cpu_lim)],
-    ["Memory", "GiB", gib(c.mem_alloc), gib(c.mem_req), m ? gib(c.mem_used) : null, gib(c.mem_lim)],
+    ["CPU", "vCPU", vcpu(c.cpu_alloc), [vcpu(c.cpu_req_work), vcpu(c.cpu_req_sys)], m ? vcpu(c.cpu_used) : null, vcpu(c.cpu_lim), vcpu(c.cpu_n1)],
+    ["Memory", "GiB", gib(c.mem_alloc), [gib(c.mem_req_work), gib(c.mem_req_sys)], m ? gib(c.mem_used) : null, gib(c.mem_lim), gib(c.mem_n1)],
   ];
   const W = widthOf(box, 1000), narrow = W < 640;
   const labelW = narrow ? 0 : 70, rightW = narrow ? 0 : 230, barH = 22, rowH = narrow ? 64 : 40, barY = narrow ? 18 : 6;
   const svg = sv("svg", { viewBox: `0 0 ${W} ${rows.length * rowH}`, width: W, height: rows.length * rowH, role: "img", "aria-label": "Cluster capacity" });
-  rows.forEach(([name, unit, alloc, req, used, lim], i) => {
+  rows.forEach(([name, unit, alloc, parts, used, lim, n1], i) => {
     const y = i * rowH + barY, plotW = W - labelW - rightW;
+    const req = parts[0] + parts[1];
     const scale = plotW / Math.max(alloc, req, used || 0, 1e-9);
     svg.append(svText({ x: 0, y: narrow ? y - 6 : y + barH / 2 + 4 }, name));
     svg.append(sv("rect", { x: labelW, y, width: Math.max(alloc, req) * scale, height: barH, rx: 4, fill: "var(--track)" }));
-    svg.append(sv("path", { d: barPath(labelW, y, Math.max(req * scale, 1), barH, 4), fill: "var(--series-1)" }));
-    const hit = sv("rect", { x: labelW, y: y - 4, width: plotW, height: barH + 8, class: "hit" });
-    attachTip(hit, (e) => showTip(e, name, [
-      ["var(--series-1)", "Requested", `${smart(req)} ${unit} (${num(pct(req, alloc), 0)}%)`],
-      ...(used != null ? [["var(--series-2)", "Used now", `${smart(used)} ${unit} (${num(pct(used, alloc), 0)}%)`]] : []),
+    let x = labelW;
+    parts.forEach((v, k) => {
+      if (v <= 0) return;
+      const w = Math.max(v * scale - 2, 1), isLast = k === parts.length - 1 || parts[k + 1] <= 0;
+      svg.append(isLast ? sv("path", { d: barPath(x, y, w, barH, 4), fill: colors[k] }) : sv("rect", { x, y, width: w, height: barH, fill: colors[k] }));
+      const hit = sv("rect", { x, y: y - 4, width: w + 2, height: barH + 8, class: "hit" });
+      attachTip(hit, (e) => showTip(e, `${name} · ${names[k]}`, [
+        [colors[k], "Requested", `${smart(v)} ${unit}`], [null, "Share of allocatable", `${num(pct(v, alloc), 1)}%`]]));
+      svg.append(hit);
+      x += v * scale;
+    });
+    const rest = sv("rect", { x, y: y - 4, width: Math.max(labelW + plotW - x, 0), height: barH + 8, class: "hit" });
+    attachTip(rest, (e) => showTip(e, name, [
+      [null, "Requested", `${smart(req)} ${unit} (${num(pct(req, alloc), 0)}%)`],
+      ...(used != null ? [["var(--series-3)", "Used now", `${smart(used)} ${unit} (${num(pct(used, alloc), 0)}%)`]] : []),
       [null, "Limits", `${smart(lim)} ${unit} (${num(pct(lim, alloc), 0)}%)`],
       [null, "Allocatable", `${smart(alloc)} ${unit}`]]));
-    svg.append(hit);
-    if (req > alloc && alloc > 0) {
+    svg.append(rest);
+    if (req > alloc && alloc > 0) {   // allocatable marker when requests exceed schedulable capacity
       const ax = labelW + alloc * scale;
       svg.append(sv("line", { x1: ax, x2: ax, y1: y - 4, y2: y + barH + 4, stroke: "var(--text-primary)", "stroke-width": 2 }));
     }
     if (used != null) {
       const ux = labelW + used * scale;
-      svg.append(sv("line", { x1: ux, x2: ux, y1: y - 5, y2: y + barH + 5, stroke: "var(--series-2)", "stroke-width": 3, "pointer-events": "none" }));
+      svg.append(sv("line", { x1: ux, x2: ux, y1: y - 5, y2: y + barH + 5, stroke: "var(--series-3)", "stroke-width": 3, "pointer-events": "none" }));
+    }
+    if (c.nodesSched >= 2 && alloc > 0) {   // N+1 marker: capacity left if the largest node fails
+      const nx = labelW + Math.max(n1, 0) * scale;
+      svg.append(sv("line", { x1: nx, x2: nx, y1: y - 5, y2: y + barH + 5, stroke: "var(--text-primary)", "stroke-width": 2, "stroke-dasharray": "3 2" }));
+      const hit = sv("rect", { x: nx - 4, y: y - 5, width: 8, height: barH + 10, class: "hit" });
+      attachTip(hit, (e) => showTip(e, `${name} · if the largest node fails`, [
+        [null, "Capacity left", `${smart(n1)} ${unit}`], [null, "Share of allocatable", `${num(pct(n1, alloc), 0)}%`]]));
+      svg.append(hit);
     }
     const free = alloc - req;
     svg.append(svText(narrow ? { x: 0, y: y + barH + 16, class: "val" } : { x: W, y: y + barH / 2 + 4, "text-anchor": "end", class: "val" },
       `${num(pct(req, alloc), 0)}% · ` + (free >= 0 ? `${smart(free)} ${unit} free` : `over by ${smart(-free)} ${unit}`)));
   });
   box.replaceChildren(svg);
+  renderN1Note(c);
+}
+function renderN1Note(c) {
   const off = c.nodes - c.nodesSched;
-  $("#capNote").textContent = `Limits: CPU ${num(pct(c.cpu_lim, c.cpu_alloc), 0)}% · memory ${num(pct(c.mem_lim, c.mem_alloc), 0)}% of allocatable (over 100% = overcommitted).` +
-    (off ? ` Not counted: ${off} unschedulable node(s) (cordoned, or NoSchedule / NoExecute taint such as a dedicated control plane) and what runs on them.` : "");
+  const line = (res, unit, alloc, largest, n1, system, left, work) =>
+    `${res}: ${smart(alloc)} allocatable − ${smart(largest)} largest node = ${smart(n1)} after a node failure − ${smart(system)} platform components = ` +
+    `${smart(left)} ${unit} for workloads; workloads request ${smart(work)} ${unit}` +
+    (work > left + 1e-9 ? ` — ${smart(work - left)} ${unit} would not fit after a node failure.` : " — fits.");
+  const notCounted = off ? ` Not counted: ${off} unschedulable node(s) (cordoned, or NoSchedule / NoExecute taint such as a dedicated control plane) and what runs on them.` : "";
+  const limits = `Limits: CPU ${num(pct(c.cpu_lim, c.cpu_alloc), 0)}% · memory ${num(pct(c.mem_lim, c.mem_alloc), 0)}% of allocatable (over 100% = overcommitted).`;
+  if (c.nodesSched < 2) {
+    $("#capNote").replaceChildren(el("b", { text: "N+1: " }), "only one schedulable node, so nothing survives a node failure." + notCounted, el("br"), limits);
+    return;
+  }
+  $("#capNote").replaceChildren(
+    el("b", { text: "N+1 (dashed line): " }),
+    "the capacity left if the largest schedulable node fails. Platform components (system namespaces: kube-*, cattle-*, *-system, ingress, …) " +
+      "come off first; the rest is what workloads can safely request." + notCounted,
+    el("br"), line("CPU", "vCPU", vcpu(c.cpu_alloc), vcpu(c.largest_cpu), vcpu(c.cpu_n1), vcpu(c.cpu_req_sys), vcpu(c.cpu_room), vcpu(c.cpu_req_work)),
+    el("br"), line("Memory", "GiB", gib(c.mem_alloc), gib(c.largest_mem), gib(c.mem_n1), gib(c.mem_req_sys), gib(c.mem_room), gib(c.mem_req_work)),
+    el("br"), limits);
 }
 
 // grouped horizontal bars; rows: [{label, dim, a, b, valText, tip:[...], onClick}]

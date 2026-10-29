@@ -30,7 +30,8 @@ The Rancher shell pod is ephemeral, so repeat this per session.
 
 ### Live dashboard from the Rancher shell (`k-serve`)
 `k-serve [port]` (default `8080`) starts a live dashboard for the current cluster: tiles, capacity bars, CPU and memory
-by node and by namespace (requested vs. used), and sortable tables of nodes, namespaces and pods. It auto-refreshes
+by node and by namespace (requested vs. used), N+1 (room left for workloads if the largest node fails, after platform
+components), and sortable tables of nodes, namespaces and pods. It auto-refreshes
 every 30 s, follows the light/dark system theme and is self-contained (no CDN). It runs on what the shell image has
 (perl, bash, kubectl, jq) and prints the URL that reaches it through Rancher:
 ```
