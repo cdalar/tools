@@ -11,6 +11,8 @@
 #   k-nodemem                      per node: pods, memory and CPU requests and limits vs allocatable
 #   k-nstotals [key]               per namespace: pods, memory and CPU requests and limits, % of cluster; total last
 #   k-nsreq <namespace> [key]      workloads in a namespace: pods, requests per pod and in total (% of namespace), limits per pod
+#   k-events [ns|all] [severity]   important problems: OOM kills, quota, unschedulable pods, crash loops, images,
+#                                  volumes, evictions, node pressure (default all namespaces, medium and up)
 #   k-nodereport [namespace]       per node: pods, memory allocatable / requested / limits / used, CPU requested / limits / used;
 #                                  with a namespace, also that namespace's pods and memory request per node
 #   k-serve [port]                 live dashboard in the browser (charts, tables; default port 8080), served from this pod;
@@ -67,6 +69,7 @@ k-toppods [N] [key]            top N pods by request or limit, with node and % o
 k-nodemem                      per node: memory and CPU requests and limits vs allocatable
 k-nstotals [key]               per namespace: memory and CPU requests and limits, % of cluster; cluster total last
 k-nsreq <namespace> [key]      workloads in a namespace: requests per pod and in total (% of namespace), limits per pod
+k-events [ns|all] [severity]   OOM kills, quota, unschedulable, crash loops, images, volumes, evictions, node pressure
 k-nodereport [namespace]       per node: memory alloc/requested/limits/used, CPU requested/limits/used (+ namespace share)
 key (sort order): mem | cpu | memlim | cpulim
 * = unschedulable node (cordoned / NoSchedule / NoExecute), left out of totals
@@ -251,6 +254,112 @@ k-nodereport() {
     | [.node,.pods,.alloc,.req,.lim,.calloc,.creq,.clim,.nspods,.nsreq,.sched] | @tsv')
 }
 
+
+# ---------- k-events: important problems, from events, pod status and quotas ----------
+
+# jq for k-events. Input: kubectl get events,pods,resourcequotas -o json. Output: TSV rows
+# severity, category, namespace, object, count, age, message -- most severe first, then most recent.
+# Pod status and quota usage are read too: OOM kills are not events (only the container's last state says so),
+# and events expire after about an hour.
+_K8S_EVENTS_JQ='
+  def ts: if . == null or . == "" then null else (sub("\\.[0-9]+"; "") | fromdateiso8601) end;
+  def age: if . == null then "-" else (now - .) as $s
+    | if $s < 60 then "\($s | floor)s" elif $s < 3600 then "\($s / 60 | floor)m"
+      elif $s < 86400 then "\($s / 3600 | floor)h" else "\($s / 86400 | floor)d" end end;
+  def rank: {"critical": 0, "high": 1, "medium": 2, "low": 3}[.];
+  def oneline: gsub("\\s+"; " ");
+  # event {reason, message, type} -> [severity, category], or null when it is not worth showing
+  def classify: .reason as $r | (.message // "") as $m |
+    if ($r | test("^(OOMKilling|SystemOOM|OOMKilled)$")) then ["critical", "OOM"]
+    elif ($r | test("^(NodeNotReady|NodeHasDiskPressure|NodeHasMemoryPressure|NodeHasPIDPressure|EvictionThresholdMet)$")) then ["critical", "Node"]
+    elif ($m | test("exceeded quota|must specify (limits|requests)|LimitRange|maximum (cpu|memory) usage per"; "i")) then ["high", "Quota"]
+    elif ($r | test("^(FailedScheduling|NotTriggerScaleUp|FailedPreemption)$")) then ["high", "Scheduling"]
+    elif ($r | test("^(Evicted|Preempting|Preempted|TaintManagerEviction)$")) then ["high", "Eviction"]
+    elif ($r | test("^(ErrImagePull|ImagePullBackOff|InspectFailed|ErrImageNeverPull)$"))
+         or (($r == "Failed" or $r == "BackOff") and ($m | test("image|pull"; "i"))) then ["high", "Image"]
+    elif $r == "BackOff" then ["high", "CrashLoop"]
+    elif ($r | test("^(FailedMount|FailedAttachVolume|FailedMapVolume|ProvisioningFailed|VolumeResizeFailed|FailedBinding)$")) then ["high", "Storage"]
+    elif ($r | test("^(FailedCreatePodSandBox|FailedKillPod|NetworkNotReady|FailedCreatePodContainer)$")) then ["high", "Sandbox"]
+    elif $r == "Failed" and ($m | test("CreateContainerConfigError|not found|configmap|secret"; "i")) then ["high", "Config"]
+    elif ($r | test("^(Rebooted|FreeDiskSpaceFailed|ImageGCFailed|ContainerGCFailed|InvalidDiskCapacity)$")) then ["medium", "Node"]
+    elif ($r | test("^(Unhealthy|ProbeWarning)$")) then ["medium", "Probe"]
+    elif ($r | test("^(FailedGetResourceMetric|FailedComputeMetricsReplicas|FailedGetExternalMetric|FailedGetPodsMetric|FailedRescale)$")) then ["medium", "Autoscaling"]
+    elif ($r | test("^(FailedCreate|FailedDelete|FailedUpdate|FailedSync|FailedDaemonPod|Failed)$")) then ["medium", "Controller"]
+    elif .type == "Warning" then ["low", "Other"]
+    else null end;
+  .items as $all
+  | [ ( $all[] | select(.kind == "Event") | classify as $c | select($c != null)
+        | {sev: $c[0], cat: $c[1], ns: (.metadata.namespace // ""),
+           obj: "\(.involvedObject.kind // .regarding.kind)/\(.involvedObject.name // .regarding.name)",
+           count: (.count // .series.count // 1),
+           t: ((.lastTimestamp // .series.lastObservedTime // .eventTime // .metadata.creationTimestamp) | ts),
+           msg: ("\(.reason): " + ((.message // .note // "") | oneline))} ),
+      ( $all[] | select(.kind == "Pod") | . as $p | {ns: .metadata.namespace, obj: "Pod/\(.metadata.name)", count: 1} as $base
+        | ( ( (.status.containerStatuses // []) + (.status.initContainerStatuses // []) )[] as $cs
+            | ($cs.state.waiting.reason // "") as $w
+            | ( if ($cs.lastState.terminated.reason // $cs.state.terminated.reason // "") == "OOMKilled" then
+                  {sev: "critical", cat: "OOM", t: (($cs.state.terminated.finishedAt // $cs.lastState.terminated.finishedAt) | ts),
+                   msg: "container \($cs.name) OOMKilled, \($cs.restartCount) restarts, memory limit \(
+                     ((($p.spec.containers // []) + ($p.spec.initContainers // [])) | map(select(.name == $cs.name)) | .[0].resources.limits.memory) // "none")"}
+                else empty end,
+                if $w == "CrashLoopBackOff" then
+                  {sev: "high", cat: "CrashLoop", t: ($cs.lastState.terminated.finishedAt | ts),
+                   msg: "container \($cs.name) CrashLoopBackOff, \($cs.restartCount) restarts, last exit \($cs.lastState.terminated.reason // "?") (\($cs.lastState.terminated.exitCode // "?"))"}
+                elif ($w | test("^(ImagePullBackOff|ErrImagePull|InvalidImageName|ErrImageNeverPull)$")) then
+                  {sev: "high", cat: "Image", t: null, msg: "container \($cs.name) \($w): \($cs.state.waiting.message // "" | oneline)"}
+                elif ($w | test("^(CreateContainerConfigError|CreateContainerError|RunContainerError)$")) then
+                  {sev: "high", cat: "Config", t: null, msg: "container \($cs.name) \($w): \($cs.state.waiting.message // "" | oneline)"}
+                else empty end ) ),
+          ( if .status.reason == "Evicted" then
+              {sev: "high", cat: "Eviction", t: null, msg: "Evicted: \(.status.message // "" | oneline)"}
+            else empty end ),
+          ( (.status.conditions // [])[] | select(.type == "PodScheduled" and .status == "False")
+            | {sev: "high", cat: "Scheduling", t: (.lastTransitionTime | ts), msg: "\(.reason // "Unschedulable"): \(.message // "" | oneline)"} )
+        | $base + . ),
+      ( $all[] | select(.kind == "ResourceQuota") | . as $q | (.status.hard // {}) | to_entries[] | .key as $k
+        | ($k | test("cpu")) as $cpu
+        | (.value | if $cpu then millicores else bytes end) as $hard
+        | (($q.status.used // {})[$k] // "0" | if $cpu then millicores else bytes end) as $used
+        | select($hard > 0 and $used / $hard >= 0.9)
+        | {sev: (if $used >= $hard then "high" else "medium" end), cat: "Quota", ns: $q.metadata.namespace,
+           obj: "ResourceQuota/\($q.metadata.name)", count: 1, t: null,
+           msg: "\($k) used \($q.status.used[$k]) of \(.value) (\($used / $hard * 100 | floor)%)\(if $used < $hard then ""
+                elif ($k | test("^(pods|cpu|memory|requests\\.|limits\\.)")) then ", new pods over it are refused"
+                else ", no more can be created" end)"} ) ]
+  | map(select((.sev | rank) <= ($min | rank)))
+  | sort_by((.sev | rank), -(.t // 0))[]
+  | [.sev, .cat, .ns, .obj, .count, (.t | age), .msg] | @tsv
+'
+
+# Important problems: OOM kills, quota errors and quotas at 90%+, unschedulable pods, crash loops, image pulls,
+# volumes, evictions, node pressure, probes, autoscaling. Most severe first, then most recent.
+# Usage: k-events [namespace|all] [critical|high|medium|low]   (default: all namespaces, medium and up)
+k-events() {
+  _k8s_need || return 1
+  local ns="${1:-all}" min="${2:-medium}" color=0
+  local -a scope
+  case "$min" in critical|high|medium|low) ;; *) echo "usage: k-events [namespace|all] [critical|high|medium|low]" >&2; return 1 ;; esac
+  if [ "$ns" = all ]; then scope=(-A); else scope=(-n "$ns"); fi
+  [ -t 1 ] && color=1
+  kubectl get events,pods,resourcequotas "${scope[@]}" -o json | jq -r --arg min "$min" "$_K8S_JQ_DEFS$_K8S_EVENTS_JQ" \
+  | awk -F'\t' -v color="$color" '
+      function cut(s, n) { return length(s) > n ? substr(s, 1, n - 1) "…" : s }
+      function paint(sev, s) {
+        if (!color) return s
+        return (sev == "critical" ? "\033[31m" : sev == "high" ? "\033[33m" : sev == "medium" ? "\033[36m" : "\033[2m") s "\033[0m"
+      }
+      BEGIN { printf "%-9s %-11s %-24s %-44s %5s %5s  %s\n", "SEVERITY", "CATEGORY", "NAMESPACE", "OBJECT", "COUNT", "LAST", "MESSAGE" }
+      { printf "%s %-11s %-24s %-44s %5s %5s  %s\n", paint($1, sprintf("%-9s", $1)), $2, cut($3, 24), cut($4, 44), $5, $6, cut($7, 160)
+        n[$1]++; c[$2]++; total++ }
+      END {
+        if (!total) { print "no problems found"; exit }
+        printf "\n%d finding(s):", total
+        split("critical high medium low", order, " ")
+        for (i = 1; i <= 4; i++) if (n[order[i]]) printf " %s %d", order[i], n[order[i]]
+        printf " |"; for (k in c) printf " %s %d", k, c[k]
+        printf "\nEvents expire after about an hour; OOMKilled, crash loops, unschedulable pods and quotas come from current status.\n"
+      }'
+}
 
 # ---------- k-serve: live dashboard in the browser through the Rancher pod proxy ----------
 
