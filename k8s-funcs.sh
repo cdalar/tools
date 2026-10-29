@@ -15,7 +15,7 @@
 #                                  volumes, evictions, node pressure (default all namespaces, medium and up)
 #   k-nodereport [namespace]       per node: pods, memory allocatable / requested / limits / used, CPU requested / limits / used;
 #                                  with a namespace, also that namespace's pods and memory request per node
-#   k-serve [port]                 live dashboard in the browser (charts, tables; default port 8080), served from this pod;
+#   k-serve [port]                 live dashboard in the browser (charts, tables, problems; default port 8080), served from this pod;
 #                                  prints the Rancher URL that reaches it through the API server's pod proxy
 # key (sort order): mem | cpu | memlim | cpulim
 #
@@ -257,11 +257,11 @@ k-nodereport() {
 
 # ---------- k-events: important problems, from events, pod status and quotas ----------
 
-# jq for k-events. Input: kubectl get events,pods,resourcequotas -o json. Output: TSV rows
-# severity, category, namespace, object, count, age, message -- most severe first, then most recent.
+# jq definitions for k-events and the k-serve Problems panel. findings: input kubectl get events,pods,resourcequotas
+# -o json; output [{sev, cat, ns, obj, count, t (epoch or null), msg}].
 # Pod status and quota usage are read too: OOM kills are not events (only the container's last state says so),
 # and events expire after about an hour.
-_K8S_EVENTS_JQ='
+_K8S_EVENTS_DEFS='
   def ts: if . == null or . == "" then null else (sub("\\.[0-9]+"; "") | fromdateiso8601) end;
   def age: if . == null then "-" else (now - .) as $s
     | if $s < 60 then "\($s | floor)s" elif $s < 3600 then "\($s / 60 | floor)m"
@@ -287,7 +287,7 @@ _K8S_EVENTS_JQ='
     elif ($r | test("^(FailedCreate|FailedDelete|FailedUpdate|FailedSync|FailedDaemonPod|Failed)$")) then ["medium", "Controller"]
     elif .type == "Warning" then ["low", "Other"]
     else null end;
-  .items as $all
+  def findings: .items as $all
   | [ ( $all[] | select(.kind == "Event") | classify as $c | select($c != null)
         | {sev: $c[0], cat: $c[1], ns: (.metadata.namespace // ""),
            obj: "\(.involvedObject.kind // .regarding.kind)/\(.involvedObject.name // .regarding.name)",
@@ -325,10 +325,7 @@ _K8S_EVENTS_JQ='
            obj: "ResourceQuota/\($q.metadata.name)", count: 1, t: null,
            msg: "\($k) used \($q.status.used[$k]) of \(.value) (\($used / $hard * 100 | floor)%)\(if $used < $hard then ""
                 elif ($k | test("^(pods|cpu|memory|requests\\.|limits\\.)")) then ", new pods over it are refused"
-                else ", no more can be created" end)"} ) ]
-  | map(select((.sev | rank) <= ($min | rank)))
-  | sort_by((.sev | rank), -(.t // 0))[]
-  | [.sev, .cat, .ns, .obj, .count, (.t | age), .msg] | @tsv
+                else ", no more can be created" end)"} ) ];
 '
 
 # Important problems: OOM kills, quota errors and quotas at 90%+, unschedulable pods, crash loops, image pulls,
@@ -341,7 +338,9 @@ k-events() {
   case "$min" in critical|high|medium|low) ;; *) echo "usage: k-events [namespace|all] [critical|high|medium|low]" >&2; return 1 ;; esac
   if [ "$ns" = all ]; then scope=(-A); else scope=(-n "$ns"); fi
   [ -t 1 ] && color=1
-  kubectl get events,pods,resourcequotas "${scope[@]}" -o json | jq -r --arg min "$min" "$_K8S_JQ_DEFS$_K8S_EVENTS_JQ" \
+  kubectl get events,pods,resourcequotas "${scope[@]}" -o json | jq -r --arg min "$min" "$_K8S_JQ_DEFS$_K8S_EVENTS_DEFS"'
+      findings | map(select((.sev | rank) <= ($min | rank))) | sort_by((.sev | rank), -(.t // 0))[]
+      | [.sev, .cat, .ns, .obj, .count, (.t | age), .msg] | @tsv' \
   | awk -F'\t' -v color="$color" '
       function cut(s, n) { return length(s) > n ? substr(s, 1, n - 1) "…" : s }
       function paint(sev, s) {
@@ -380,6 +379,8 @@ _K8S_DASH_JQ='
          no_cpu_req: ([.spec.containers[] | select(.resources.requests.cpu == null)] | length),
          no_mem_lim: ([.spec.containers[] | select(.resources.limits.memory == null)] | length)}] as $pods
   | {collected_at: (now | todate), cluster: $cluster, metrics: ($un | length > 0), pods: $pods,
+     problems: ({items: ([.items[] | select(.kind == "Pod")] + $ev[0].items)} | findings | sort_by((.sev | rank), -(.t // 0))),
+     problems_error: ($ev[0].error // null),
      nodes: [.items[] | select(.kind == "Node") | .metadata.name as $n
        | ($pods | map(select(.node == $n and .phase == "Running"))) as $p
        | {name: $n, sched: schedulable,
@@ -399,8 +400,10 @@ set -o pipefail
 t="$K_SERVE_DIR"
 kubectl top nodes --no-headers > "$t/topn" 2>/dev/null || : > "$t/topn"
 kubectl top pods -A --no-headers > "$t/topp" 2>/dev/null || : > "$t/topp"
+kubectl get events,resourcequotas -A -o json > "$t/ev" 2> "$t/everr" \
+  || printf "{\"items\":[],\"error\":%s}" "$(jq -Rs . < "$t/everr")" > "$t/ev"
 kubectl get nodes,pods -A -o json \
-  | jq -c --rawfile topn "$t/topn" --rawfile topp "$t/topp" --arg cluster "$K_SERVE_CLUSTER" "$K_SERVE_JQ"
+  | jq -c --rawfile topn "$t/topn" --rawfile topp "$t/topp" --slurpfile ev "$t/ev" --arg cluster "$K_SERVE_CLUSTER" "$K_SERVE_JQ"
 '
 
 # HTTP server for k-serve: GET / (the dashboard page) and GET api/data (collector output, cached 10 s;
@@ -496,7 +499,7 @@ h2 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
 .sub { color: var(--text-secondary); font-size: 13px; }
 .muted { color: var(--text-muted); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-button, input[type=search] { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
+button, select, input[type=search] { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
 button { cursor: pointer; }
 button:hover { background: var(--hover); }
 button:disabled { opacity: .5; cursor: default; }
@@ -545,6 +548,8 @@ tr.selected { background: var(--hover); }
 #tooltip .k i { width: 12px; height: 2px; display: inline-block; }
 #tooltip b { font-variant-numeric: tabular-nums; }
 .loading { opacity: .55; transition: opacity .2s; }
+td.msg { white-space: normal; min-width: 320px; max-width: 640px; }
+.chip select { padding: 1px 4px; }
 @media (max-width: 520px) { .tile .value { font-size: 22px; } .tiles { grid-template-columns: 1fr 1fr; } #search { flex: 1 1 100%; } }
 </style>
 </head>
@@ -564,6 +569,22 @@ tr.selected { background: var(--hover); }
 
   <div id="banners"></div>
   <div class="tiles" id="tiles"></div>
+
+  <div class="card section" id="problemsCard">
+    <div class="section-head">
+      <div><h2>Problems</h2><div class="sub" id="problemsSub"></div></div>
+      <div class="actions">
+        <div class="legend" id="problemsCounts"></div>
+        <label class="chip">Severity <select id="sev" aria-label="Minimum severity">
+          <option value="critical">critical</option>
+          <option value="high">high and up</option>
+          <option value="medium">medium and up</option>
+          <option value="low">all</option>
+        </select></label>
+      </div>
+    </div>
+    <div class="table-wrap"><table id="problemsTable"></table></div>
+  </div>
 
   <div class="card section">
     <div class="section-head">
@@ -630,7 +651,8 @@ const $ = (s) => document.querySelector(s);
 const GIB = 1073741824, MIB = 1048576;
 const SYSTEM_NS = /^(kube-|cattle-|fleet-|calico-|tigera-|rancher-|longhorn-|ingress-|cert-manager$)|-system$/;
 const state = { data: null, d: null, err: null, q: "", sys: true, ns: null, busy: false,
-                sort: { nodes: ["mem_req_pct", -1], ns: ["cpu_req", -1], pods: ["mem_req", -1] } };
+                sev: "high", sort: { nodes: ["mem_req_pct", -1], ns: ["cpu_req", -1], pods: ["mem_req", -1], problems: ["sev", 1] } };
+try { const v = localStorage.getItem("sev"); if (["critical", "high", "medium", "low"].includes(v)) state.sev = v; } catch (e) { /* ignore */ }
 
 // ---------- formatting ----------
 const nf = (d) => { const f = new Intl.NumberFormat("en-US", { maximumFractionDigits: d, minimumFractionDigits: 0 });
@@ -753,6 +775,7 @@ function statusBanner(kind, title, text) {
 function renderBanners() {
   const out = [];
   if (state.err) out.push(statusBanner("critical", state.data ? "Last refresh failed — showing the previous data" : "Could not load data", state.err));
+  if (state.data && state.data.problems_error) out.push(statusBanner("warning", "Problems panel is missing events and quotas", state.data.problems_error));
   if (state.data && !state.data.metrics) out.push(statusBanner("warning", "metrics-server not available", "Usage (kubectl top) is missing; charts show requests and limits only."));
   $("#banners").replaceChildren(...out);
 }
@@ -778,6 +801,7 @@ function renderTiles() {
       c.pending ? "warning" : "good"),
     tile("Containers without CPU request", f0.format(c.no_cpu_req), "", `of ${f0.format(c.containers)} · ${f0.format(c.no_mem_lim)} without memory limit`,
       c.no_cpu_req + c.no_mem_lim > 0 ? "serious" : "good"),
+    problemsTile(),
   );
 }
 
@@ -1021,11 +1045,52 @@ function selectNs(ns) {
   if (ns) $("#podsTable").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+// ---------- problems (k-events) ----------
+const SEVERITIES = ["critical", "high", "medium", "low"];
+const sevRank = (s) => SEVERITIES.indexOf(s);
+const SEV_COLOR = { critical: "var(--status-critical)", high: "var(--status-serious)", medium: "var(--status-warning)", low: "var(--text-muted)" };
+const sevLabel = (s) => (s === "low" ? "any severity" : s === "critical" ? "critical" : `${s} and up`);
+function problemsTile() {
+  const all = state.data.problems || [];
+  const n = (s) => all.filter((p) => p.sev === s).length;
+  const crit = n("critical"), high = n("high");
+  return tile("Problems (critical + high)", f0.format(crit + high), "", `${crit} critical · ${high} high · ${n("medium")} medium`,
+    crit ? "critical" : high ? "serious" : "good");
+}
+function renderProblems() {
+  const all = (state.data.problems || []).filter((p) => state.ns ? p.ns === state.ns
+    : (!p.ns || nsVisible(p.ns)) && matches(p.ns, p.obj, p.cat, p.msg));
+  const shown = all.filter((p) => sevRank(p.sev) <= sevRank(state.sev));
+  $("#problemsCounts").replaceChildren(...SEVERITIES.map((s) => [s, all.filter((p) => p.sev === s).length]).filter(([, k]) => k)
+    .map(([s, k]) => el("span", {}, el("span", { class: "dot", style: `background:${SEV_COLOR[s]}` }), `${k} ${s}`)));
+  $("#sev").value = state.sev;
+  const LIMIT = 200;
+  const total = renderTable($("#problemsTable"), "problems", [
+    { k: "sev", h: "Severity", l: true, v: (r) => sevRank(r.sev),
+      cell: (r) => el("td", { class: "l" }, el("span", { class: "flag" }, el("span", { class: "dot", style: `background:${SEV_COLOR[r.sev]}` }), r.sev)) },
+    { k: "cat", h: "Category", l: true },
+    { k: "ns", h: "Namespace", l: true, fmt: (r) => r.ns || "–" },
+    { k: "obj", h: "Object", l: true },
+    { k: "count", h: "Count", fmt: (r) => f0.format(r.count) },
+    { k: "t", h: "Last", v: (r) => -(r.t || 0), fmt: (r) => r.t ? ago(new Date(r.t * 1000).toISOString()) : "–", title: "Last seen" },
+    { k: "msg", h: "Message", l: true, cell: (r) => el("td", { class: "l msg", text: r.msg }) },
+  ], shown, (tr, r) => {
+    if (!r.ns) return;
+    tr.classList.add("clickable");
+    tr.title = `Show pods in ${r.ns}`;
+    tr.addEventListener("click", () => selectNs(r.ns));
+  }, LIMIT);
+  $("#problemsSub").textContent = (shown.length ? `${f0.format(total)} at ${sevLabel(state.sev)}` : `No problems at ${sevLabel(state.sev)}`) +
+    (total > LIMIT ? ` · showing ${LIMIT}` : "") + (state.ns ? ` · namespace ${state.ns}` : "") +
+    " · from events (last ~1 h), pod status and quotas · click a row for its pods";
+}
+
 function render() {
   renderMeta();
   renderBanners();
   if (!state.data) return;
   renderTiles();
+  renderProblems();
   renderCapacity();
   renderNodeChart("#nodeCpu", "#nodeCpuLegend", "cpu");
   renderNodeChart("#nodeMem", "#nodeMemLegend", "mem");
@@ -1059,6 +1124,11 @@ async function load(fresh) {
 
 $("#refresh").addEventListener("click", () => load(true));
 $("#auto").addEventListener("change", (e) => { clearTimeout(timer); if (e.target.checked) timer = setTimeout(() => load(false), 30000); });
+$("#sev").addEventListener("change", (e) => {
+  state.sev = e.target.value;
+  try { localStorage.setItem("sev", state.sev); } catch (err) { /* storage unavailable */ }
+  render();
+});
 $("#sys").addEventListener("change", (e) => { state.sys = e.target.checked; render(); });
 $("#search").addEventListener("input", (e) => { state.q = e.target.value.trim().toLowerCase(); state.ns = null; render(); });
 $("#clearNs").addEventListener("click", () => selectNs(null));
@@ -1098,7 +1168,7 @@ k-serve() {
   echo "  ${server:-https://<rancher>}/k8s/clusters/${cid:-<cluster-id>}/api/v1/namespaces/$ns/pods/$pod:$port/proxy/"
   [ -n "$cid" ] || echo "  (cluster id not found: it is the <id> in your browser URL .../dashboard/c/<id>/...; or set K_CLUSTER_ID)"
   [ -n "$server" ] || echo "  (Rancher URL not found: set K_RANCHER_URL=https://your.rancher.host)"
-  K_SERVE_DIR="$dir" K_SERVE_CLUSTER="${cid:-}" K_SERVE_JQ="$_K8S_JQ_DEFS$_K8S_DASH_JQ" K_SERVE_COLLECT="$_K8S_SERVE_COLLECT" \
+  K_SERVE_DIR="$dir" K_SERVE_CLUSTER="${cid:-}" K_SERVE_JQ="$_K8S_JQ_DEFS$_K8S_EVENTS_DEFS$_K8S_DASH_JQ" K_SERVE_COLLECT="$_K8S_SERVE_COLLECT" \
     perl -e "$_K8S_SERVE_PL" "$port" "$dir"
   rm -rf "$dir"
 }
