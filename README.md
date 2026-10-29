@@ -28,12 +28,14 @@ or paste it: run `cat > ~/k8s-funcs.sh`, paste the file contents, press `Ctrl-D`
 
 The Rancher shell pod is ephemeral, so repeat this per session.
 
-### Serve files from the Rancher shell (`k-serve`)
-`k-serve [port] [dir]` (default `8080`, current dir) starts a small HTTP file server (perl, which the shell image has)
-and prints the URL that reaches it through Rancher:
+### Live dashboard from the Rancher shell (`k-serve`)
+`k-serve [port]` (default `8080`) starts a live dashboard for the current cluster: tiles, capacity bars, CPU and memory
+by node and by namespace (requested vs. used), and sortable tables of nodes, namespaces and pods. It auto-refreshes
+every 30 s, follows the light/dark system theme and is self-contained (no CDN). It runs on what the shell image has
+(perl, bash, kubectl, jq) and prints the URL that reaches it through Rancher:
 ```
 https://<rancher>/k8s/clusters/<cluster-id>/api/v1/namespaces/cattle-system/pods/<shell-pod>:<port>/proxy/
 ```
-Handy for viewing report output in the browser, e.g. `mkdir ~/r && k-nodereport > ~/r/nodes.txt && k-serve 8080 ~/r`.
-Opening the URL needs the `pods/proxy` permission in `cattle-system` (cluster admins have it). Dotfiles (like
-`~/.kube/config`) are never served. If the cluster ID or Rancher URL can't be detected, set `K_CLUSTER_ID` / `K_RANCHER_URL`.
+Opening the URL needs the `pods/proxy` permission in `cattle-system` (cluster admins have it). It is read-only: it only
+runs `kubectl get nodes,pods` and `kubectl top`, and serves no files. Usage needs metrics-server. If the cluster ID or
+Rancher URL can't be detected, set `K_CLUSTER_ID` / `K_RANCHER_URL`.
