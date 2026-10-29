@@ -12,7 +12,9 @@ Tools for Cloud
 `./unsetAWSCreds.sh`
 
 ## Kubernetes resource reports (`k8s-funcs.sh`)
-Read-only kubectl + jq helpers: `toppods`, `nodemem`, `nstotals`, `nsreq <ns>`, `nodereport [ns]`.
+Read-only kubectl + jq helpers, all prefixed `k-` (type `k-<TAB>`, or `k-help`):
+`k-toppods [N] [mem|cpu]`, `k-nodemem`, `k-nstotals [mem|cpu]`, `k-nsreq <ns> [mem|cpu]`, `k-nodereport [ns]`.
+Each shows memory and CPU requests with percentages (of node / cluster allocatable / namespace total).
 Needs `kubectl`, `jq`, `awk` (bash).
 
 In a Rancher "Kubectl Shell" (or anywhere), either download it:

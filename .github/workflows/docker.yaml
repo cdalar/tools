@@ -2,11 +2,15 @@ name: ci
 
 on:
   pull_request:
-    branches:    
+    branches:
       - 'main'
+    paths:
+      - 'images/**'
   push:
     branches:
       - 'main'
+    paths:
+      - 'images/**'
 
 jobs:
   docker:
