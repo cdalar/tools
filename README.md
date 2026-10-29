@@ -23,7 +23,8 @@ Needs `kubectl`, `jq`, `awk` (bash).
 `k-events [namespace|all] [critical|high|medium|low]` lists what needs attention, most severe first: OOM kills,
 quota errors and quotas at 90%+, unschedulable pods, crash loops, image pulls, volume mounts, evictions, node
 pressure, failing probes and autoscaling. Besides events (which expire after about an hour) it reads pod status, so
-OOMKilled containers and crash loops show up even when no event exists, and ResourceQuota usage.
+OOMKilled containers and crash loops show up even when no event exists, and ResourceQuota usage. `k-serve` shows the same findings in a
+Problems panel with a severity selector (default: high and up) and a Problems tile.
 
 In a Rancher "Kubectl Shell" (or anywhere), either download it:
 ```
