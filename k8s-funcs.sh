@@ -17,6 +17,8 @@
 #
 # Limits are summed over containers that set one; a container without a limit counts as 0 (and "-" means none set).
 # LIM% over 100 is flagged with "!" (limits overcommit the allocatable capacity).
+# Unschedulable nodes (cordoned, or tainted NoSchedule/NoExecute, e.g. control plane) are marked "*" and left out
+# of node TOTALs; k-nstotals counts only schedulable nodes and the pods on them.
 #
 # Requires: kubectl, jq, awk, bash or zsh. Usage in k-nodereport needs metrics-server ("n/a" without it).
 
@@ -33,6 +35,8 @@ _K8S_JQ_DEFS='
   def podcpu:    [.spec.containers[].resources.requests.cpu | millicores] | add // 0;
   def podmemlim: [.spec.containers[].resources.limits.memory | bytes] | add // 0;
   def podcpulim: [.spec.containers[].resources.limits.cpu | millicores] | add // 0;
+  def schedulable: (.spec.unschedulable // false | not)
+    and ([.spec.taints[]? | select(.effect=="NoSchedule" or .effect=="NoExecute")] | length == 0);
 '
 
 # awk helpers: Mi / millicores, or "-" when zero (no limit set); percentage with "!" over 100
@@ -62,6 +66,7 @@ k-nstotals [key]               per namespace: memory and CPU requests and limits
 k-nsreq <namespace> [key]      workloads in a namespace: requests per pod and in total (% of namespace), limits per pod
 k-nodereport [namespace]       per node: memory alloc/requested/limits/used, CPU requested/limits/used (+ namespace share)
 key (sort order): mem | cpu | memlim | cpulim
+* = unschedulable node (cordoned / NoSchedule / NoExecute), left out of totals
 EOF
 }
 
@@ -102,9 +107,10 @@ k-nodemem() {
             mem: ([$p[] | podmem] | add // 0), mlim: ([$p[] | podmemlim] | add // 0),
             malloc: (.status.allocatable.memory | bytes),
             cpu: ([$p[] | podcpu] | add // 0), clim: ([$p[] | podcpulim] | add // 0),
-            calloc: (.status.allocatable.cpu | millicores) } ]
-    | sort_by(-(if .malloc > 0 then .mem/.malloc else 0 end))[]
-    | [.node,.pods,.mem,.mlim,.malloc,.cpu,.clim,.calloc] | @tsv' \
+            calloc: (.status.allocatable.cpu | millicores),
+            sched: (if schedulable then 1 else 0 end) } ]
+    | sort_by(-.sched, -(if .malloc > 0 then .mem/.malloc else 0 end))[]
+    | [.node,.pods,.mem,.mlim,.malloc,.cpu,.clim,.calloc,.sched] | @tsv' \
   | awk -F'\t' "$_K8S_AWK_DEFS"'
       function row(name, p, m, ml, ma, c, cl, ca) {
         printf "%-40s %5d %10s %10s %10s %6s %6s %10s %10s %10s %6s %6s\n",
@@ -112,8 +118,11 @@ k-nodemem() {
       }
       BEGIN{printf "%-40s %5s %10s %10s %10s %6s %6s %10s %10s %10s %6s %6s\n",
                    "NODE","PODS","MEM_REQ","MEM_LIM","MEM_ALLOC","REQ%","LIM%","CPU_REQ","CPU_LIM","CPU_ALLOC","REQ%","LIM%"}
-      {row($1,$2,$3,$4,$5,$6,$7,$8); tp+=$2; tm+=$3; tml+=$4; ta+=$5; tc+=$6; tcl+=$7; tca+=$8}
-      END{row("TOTAL",tp,tm,tml,ta,tc,tcl,tca)}'
+      {row($1 ($9 ? "" : "*"),$2,$3,$4,$5,$6,$7,$8)
+       if (!$9) { nx++; next }
+       tp+=$2; tm+=$3; tml+=$4; ta+=$5; tc+=$6; tcl+=$7; tca+=$8}
+      END{row("TOTAL",tp,tm,tml,ta,tc,tcl,tca)
+          if (nx) printf "* not schedulable (cordoned or NoSchedule/NoExecute taint), not in TOTAL: %d node(s)\n", nx}'
 }
 
 # Per namespace: pods, memory and CPU requests and limits, as % of the cluster's allocatable; cluster total last.
@@ -123,15 +132,21 @@ k-nstotals() {
   k="$(_k8s_sortkey "${1:-mem}")" || return 1
   kubectl get nodes,pods -A -o json | jq -r --arg k "$k" "$_K8S_JQ_DEFS"'
     .items as $all
-    | ([$all[] | select(.kind=="Node") | .status.allocatable.memory | bytes] | add // 0) as $malloc
-    | ([$all[] | select(.kind=="Node") | .status.allocatable.cpu | millicores] | add // 0) as $calloc
-    | [$all[] | select(.kind=="Pod" and .status.phase=="Running")
-        | {ns: .metadata.namespace, mem: podmem, cpu: podcpu, memlim: podmemlim, cpulim: podcpulim}]
+    | [$all[] | select(.kind=="Node")] as $nodes
+    | ($nodes | map(select(schedulable))) as $ok
+    | ($ok | map({key: .metadata.name, value: true}) | from_entries) as $okname
+    | ([$ok[] | .status.allocatable.memory | bytes] | add // 0) as $malloc
+    | ([$ok[] | .status.allocatable.cpu | millicores] | add // 0) as $calloc
+    | [$all[] | select(.kind=="Pod" and .status.phase=="Running")] as $running
+    | ($running | map(select($okname[.spec.nodeName // ""]))) as $pods
+    | (($nodes|length) - ($ok|length)) as $nx
+    | (($running|length) - ($pods|length)) as $px
+    | [$pods[] | {ns: .metadata.namespace, mem: podmem, cpu: podcpu, memlim: podmemlim, cpulim: podcpulim}]
     | group_by(.ns)
     | map({ns: .[0].ns, pods: length, mem: (map(.mem) | add), cpu: (map(.cpu) | add),
            memlim: (map(.memlim) | add), cpulim: (map(.cpulim) | add)})
     | sort_by(-.[$k])[]
-    | [.ns, .pods, .mem, .memlim, .cpu, .cpulim, $malloc, $calloc] | @tsv' \
+    | [.ns, .pods, .mem, .memlim, .cpu, .cpulim, $malloc, $calloc, $nx, $px] | @tsv' \
   | awk -F'\t' "$_K8S_AWK_DEFS"'
       function row(name, p, m, ml, c, cl, ma, ca) {
         printf "%-30s %6s %10s %6s %10s %6s %10s %6s %10s %6s\n",
@@ -139,9 +154,10 @@ k-nstotals() {
       }
       BEGIN{printf "%-30s %6s %10s %6s %10s %6s %10s %6s %10s %6s\n",
                    "NAMESPACE","PODS","MEM_REQ","MEM%","MEM_LIM","LIM%","CPU_REQ","CPU%","CPU_LIM","LIM%"}
-      {row($1,$2,$3,$4,$5,$6,$7,$8); tp+=$2; tm+=$3; tml+=$4; tc+=$5; tcl+=$6; ma=$7; ca=$8}
+      {row($1,$2,$3,$4,$5,$6,$7,$8); tp+=$2; tm+=$3; tml+=$4; tc+=$5; tcl+=$6; ma=$7; ca=$8; nx=$9; px=$10}
       END{row("TOTAL",tp,tm,tml,tc,tcl,ma,ca)
-          printf "%-30s %6s %10s %6s %10s %6s %10s\n","CLUSTER ALLOCATABLE","",mi(ma),"","","",mc(ca)}'
+          printf "%-30s %6s %10s %6s %10s %6s %10s\n","SCHEDULABLE ALLOCATABLE","",mi(ma),"","","",mc(ca)
+          if (nx) printf "not counted: %d unschedulable node(s) (cordoned or NoSchedule/NoExecute taint) and their %d pod(s)\n", nx, px}'
 }
 
 # Workloads in one namespace (pods traced through their ReplicaSet to the Deployment), % of the namespace total.
@@ -196,10 +212,11 @@ k-nodereport() {
       lim=($3?$5/$3*100:0); flag=(lim>100)?"!":" "
       clim=($6?$8/$6*100:0); cflag=(clim>100)?"!":" "
       printf "%-35s %5d %7.1fGi %7.1fGi %5.0f%% %7.1fGi %5.0f%%%s %7s %7.0f%% %7.0f%%%s %7s",
-             $1,$2,$3/gi,$4/gi,($3?$4/$3*100:0),$5/gi,lim,flag,(muse[$1]?muse[$1]:"n/a"),
+             $1 ($11 ? "" : "*"),$2,$3/gi,$4/gi,($3?$4/$3*100:0),$5/gi,lim,flag,(muse[$1]?muse[$1]:"n/a"),
              ($6?$7/$6*100:0),clim,cflag,(cuse[$1]?cuse[$1]:"n/a")
       if (ns!="") printf " %8d %8.1fGi", $9, $10/gi
       printf "\n"
+      if (!$11) { nx++; next }
       tp+=$2; ta+=$3; tr+=$4; tl+=$5; tca+=$6; tcr+=$7; tcl+=$8; tnp+=$9; tnm+=$10
     }
     END {
@@ -207,6 +224,7 @@ k-nodereport() {
              tl/gi,(ta?tl/ta*100:0),"",(tca?tcr/tca*100:0),(tca?tcl/tca*100:0),""
       if (ns!="") printf " %8d %8.1fGi", tnp, tnm/gi
       printf "\n"
+      if (nx) printf "* not schedulable (cordoned or NoSchedule/NoExecute taint), not in TOTAL: %d node(s)\n", nx
     }' \
   <(kubectl top nodes --no-headers 2>/dev/null) \
   <(kubectl get nodes,pods -A -o json | jq -r --arg ns "$ns" "$_K8S_JQ_DEFS"'
@@ -223,7 +241,8 @@ k-nodereport() {
             creq:   ([$p[] | podcpu] | add // 0),
             clim:   ([$p[] | podcpulim] | add // 0),
             nspods: ($q|length),
-            nsreq:  ([$q[] | podmem] | add // 0) } ]
-    | sort_by(-(if .alloc > 0 then .req/.alloc else 0 end))[]
-    | [.node,.pods,.alloc,.req,.lim,.calloc,.creq,.clim,.nspods,.nsreq] | @tsv')
+            nsreq:  ([$q[] | podmem] | add // 0),
+            sched:  (if schedulable then 1 else 0 end) } ]
+    | sort_by(-.sched, -(if .alloc > 0 then .req/.alloc else 0 end))[]
+    | [.node,.pods,.alloc,.req,.lim,.calloc,.creq,.clim,.nspods,.nsreq,.sched] | @tsv')
 }
