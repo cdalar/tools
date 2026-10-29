@@ -17,6 +17,7 @@ Read-only kubectl + jq helpers, all prefixed `k-` (type `k-<TAB>`, or `k-help`):
 (key: `mem`, `cpu`, `memlim`, `cpulim`).
 Each shows memory and CPU requests and limits with percentages (of node / cluster allocatable / namespace total);
 limits over 100% of allocatable are flagged with `!`.
+Unschedulable nodes (cordoned, or tainted `NoSchedule`/`NoExecute` like control-plane nodes) are marked `*` and left out of totals.
 Needs `kubectl`, `jq`, `awk` (bash).
 
 In a Rancher "Kubectl Shell" (or anywhere), either download it:
